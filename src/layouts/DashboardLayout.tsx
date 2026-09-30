@@ -5,6 +5,7 @@ import {
   Bell,
   Box,
   FileText,
+  FolderOpen,
   Globe,
   LayoutDashboard,
   Network,
@@ -36,6 +37,7 @@ const PRIMARY_NAV_ITEMS: NavItem[] = [
   { labelRu: 'Карта узлов', labelEn: 'Geo Map', to: '/map', icon: Globe, activeModule: true },
   { labelRu: 'Сети', labelEn: 'Networks', to: '/networks', icon: Network, activeModule: true },
   { labelRu: 'Контейнеры', labelEn: 'Containers', to: '/containers', icon: Box, activeModule: true },
+  { labelRu: 'Файлы (SFTP)', labelEn: 'SFTP Files', to: '/files', icon: FolderOpen, activeModule: true },
   { labelRu: 'Развёртывания', labelEn: 'Deployments', to: '/deployments', icon: Rocket, activeModule: true },
   { labelRu: 'Метрики', labelEn: 'Metrics', to: '/metrics', icon: Activity, activeModule: true },
   { labelRu: 'Логи', labelEn: 'Logs', to: '/logs', icon: FileText, activeModule: true },
@@ -74,6 +76,7 @@ export const DashboardLayout: React.FC = () => {
     if (path === '/map') return t('InfraLab / Карта узлов', 'InfraLab / Geo Map');
     if (path === '/networks') return t('InfraLab / Сети', 'InfraLab / Networks');
     if (path === '/containers') return t('InfraLab / Контейнеры', 'InfraLab / Containers');
+    if (path === '/files') return t('InfraLab / Файлы (SFTP)', 'InfraLab / SFTP Files');
     if (path === '/deployments') return t('InfraLab / Развёртывания', 'InfraLab / Deployments');
     if (path === '/metrics') return t('InfraLab / Метрики', 'InfraLab / Metrics');
     if (path === '/logs') return t('InfraLab / Логи', 'InfraLab / Logs');

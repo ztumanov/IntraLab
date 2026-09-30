@@ -293,4 +293,39 @@ export interface ServerMonitoringResponse {
   series: PrometheusMetricPoint[];
 }
 
+export type SftpEntryType = 'directory' | 'file' | 'symlink';
+
+export interface SftpFileEntry {
+  name: string;
+  path: string;
+  type: SftpEntryType;
+  size: number;
+  permissions: string;
+  owner: string;
+  group: string;
+  modified_at: string;
+}
+
+export interface SftpDirectoryListResponse {
+  server_id: number;
+  path: string;
+  parent_path: string | null;
+  entries: SftpFileEntry[];
+  exists?: boolean;
+  listed_at: string;
+}
+
+export interface SftpFileReadResponse {
+  server_id: number;
+  path: string;
+  name: string;
+  size: number;
+  encoding: 'utf8' | 'base64';
+  is_binary: boolean;
+  truncated: boolean;
+  content: string;
+  read_at: string;
+}
+
+
 

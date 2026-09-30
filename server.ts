@@ -48,6 +48,13 @@ import {
   runDockerContainerOnServer,
 } from './src/server/sshConnector.ts';
 import {
+  createRemoteDirectoryOverSsh,
+  deleteRemotePathOverSsh,
+  listRemoteDirectoryOverSsh,
+  readRemoteFileOverSsh,
+  writeRemoteFileOverSsh,
+} from './src/server/sftpManager.ts';
+import {
   activateUserTotp,
   createLocalUserAccount,
   disableUserTotp,
@@ -361,7 +368,7 @@ function serializeMetricPoint(row: {
 
 export function createApp() {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '10mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.status(200).json({
@@ -1855,6 +1862,243 @@ WantedBy=multi-user.target
     } catch (error: any) {
       console.error('GET /api/servers/:id/metrics failed:', error?.message || 'Internal error');
       return res.status(500).json({ error: 'Failed to query server metrics from Prometheus' });
+    }
+  });
+
+  // --- SFTP File Manager Endpoints (Browse, Read, Download, Edit, Upload, Mkdir, Delete) ---
+  app.get('/api/servers/:id/sftp/list', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid server ID' });
+      }
+
+      const server = await getServerById(id, uid);
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+      if (!server.encryptedSecret) {
+        return res.status(400).json({
+          error: 'Для работы SFTP необходимо настроить пароль или SSH-ключ сервера',
+        });
+      }
+
+      const targetPath = typeof req.query.path === 'string' ? req.query.path : '/etc';
+      const result = await listRemoteDirectoryOverSsh(
+        {
+          serverId: server.id,
+          ipAddress: server.ipAddress,
+          sshPort: server.sshPort,
+          username: server.username,
+          authType: server.authType === 'private_key' ? 'private_key' : 'password',
+          encryptedSecret: server.encryptedSecret,
+        },
+        targetPath
+      );
+
+      return res.status(200).json(result);
+    } catch (error: any) {
+      console.error('GET /api/servers/:id/sftp/list failed:', error?.message || 'Error');
+      return res.status(500).json({
+        error: error?.message || 'Не удалось получить список файлов по SFTP/SSH',
+      });
+    }
+  });
+
+  app.get('/api/servers/:id/sftp/read', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid server ID' });
+      }
+
+      const server = await getServerById(id, uid);
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+      if (!server.encryptedSecret) {
+        return res.status(400).json({
+          error: 'Для чтения файлов необходимо настроить пароль или SSH-ключ сервера',
+        });
+      }
+
+      const filePath = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+      if (!filePath) {
+        return res.status(400).json({ error: 'File path is required' });
+      }
+      const useSudo = req.query.sudo === 'true';
+
+      const result = await readRemoteFileOverSsh(
+        {
+          serverId: server.id,
+          ipAddress: server.ipAddress,
+          sshPort: server.sshPort,
+          username: server.username,
+          authType: server.authType === 'private_key' ? 'private_key' : 'password',
+          encryptedSecret: server.encryptedSecret,
+        },
+        filePath,
+        useSudo
+      );
+
+      return res.status(200).json(result);
+    } catch (error: any) {
+      console.error('GET /api/servers/:id/sftp/read failed:', error?.message || 'Error');
+      return res.status(500).json({
+        error: error?.message || 'Не удалось прочитать файл с сервера',
+      });
+    }
+  });
+
+  app.post('/api/servers/:id/sftp/write', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid server ID' });
+      }
+
+      const server = await getServerById(id, uid);
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+      if (!server.encryptedSecret) {
+        return res.status(400).json({
+          error: 'Для записи файлов необходимо настроить пароль или SSH-ключ сервера',
+        });
+      }
+
+      const filePath = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
+      const content = typeof req.body?.content === 'string' ? req.body.content : '';
+      const encoding = req.body?.encoding === 'base64' ? 'base64' : 'utf8';
+      const useSudo = Boolean(req.body?.use_sudo);
+
+      if (!filePath) {
+        return res.status(400).json({ error: 'File path is required' });
+      }
+
+      const result = await writeRemoteFileOverSsh(
+        {
+          serverId: server.id,
+          ipAddress: server.ipAddress,
+          sshPort: server.sshPort,
+          username: server.username,
+          authType: server.authType === 'private_key' ? 'private_key' : 'password',
+          encryptedSecret: server.encryptedSecret,
+        },
+        {
+          path: filePath,
+          content,
+          encoding,
+          useSudo,
+        }
+      );
+
+      return res.status(200).json(result);
+    } catch (error: any) {
+      console.error('POST /api/servers/:id/sftp/write failed:', error?.message || 'Error');
+      return res.status(500).json({
+        error: error?.message || 'Не удалось сохранить файл на сервер',
+      });
+    }
+  });
+
+  app.post('/api/servers/:id/sftp/mkdir', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid server ID' });
+      }
+
+      const server = await getServerById(id, uid);
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+      if (!server.encryptedSecret) {
+        return res.status(400).json({
+          error: 'Для создания папок необходимо настроить пароль или SSH-ключ сервера',
+        });
+      }
+
+      const dirPath = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
+      const useSudo = Boolean(req.body?.use_sudo);
+      if (!dirPath) {
+        return res.status(400).json({ error: 'Directory path is required' });
+      }
+
+      const result = await createRemoteDirectoryOverSsh(
+        {
+          serverId: server.id,
+          ipAddress: server.ipAddress,
+          sshPort: server.sshPort,
+          username: server.username,
+          authType: server.authType === 'private_key' ? 'private_key' : 'password',
+          encryptedSecret: server.encryptedSecret,
+        },
+        dirPath,
+        useSudo
+      );
+
+      return res.status(200).json(result);
+    } catch (error: any) {
+      console.error('POST /api/servers/:id/sftp/mkdir failed:', error?.message || 'Error');
+      return res.status(500).json({
+        error: error?.message || 'Не удалось создать директорию на сервере',
+      });
+    }
+  });
+
+  app.delete('/api/servers/:id/sftp/delete', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid server ID' });
+      }
+
+      const server = await getServerById(id, uid);
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+      if (!server.encryptedSecret) {
+        return res.status(400).json({
+          error: 'Для удаления файлов необходимо настроить пароль или SSH-ключ сервера',
+        });
+      }
+
+      const targetPath =
+        typeof req.body?.path === 'string'
+          ? req.body.path.trim()
+          : typeof req.query.path === 'string'
+            ? req.query.path.trim()
+            : '';
+      const useSudo = Boolean(req.body?.use_sudo || req.query.sudo === 'true');
+      if (!targetPath) {
+        return res.status(400).json({ error: 'Target path is required' });
+      }
+
+      const result = await deleteRemotePathOverSsh(
+        {
+          serverId: server.id,
+          ipAddress: server.ipAddress,
+          sshPort: server.sshPort,
+          username: server.username,
+          authType: server.authType === 'private_key' ? 'private_key' : 'password',
+          encryptedSecret: server.encryptedSecret,
+        },
+        targetPath,
+        useSudo
+      );
+
+      return res.status(200).json(result);
+    } catch (error: any) {
+      console.error('DELETE /api/servers/:id/sftp/delete failed:', error?.message || 'Error');
+      return res.status(500).json({
+        error: error?.message || 'Не удалось удалить объект на сервере',
+      });
     }
   });
 

@@ -270,6 +270,14 @@ export const ServerDetailsPage: React.FC = () => {
           </Link>
 
           <Link
+            to={`/files?serverId=${server.id}&path=/etc`}
+            className="inline-flex items-center gap-1.5 rounded-md border border-sky-500/40 bg-sky-500/10 px-3.5 py-1.5 text-xs font-semibold text-sky-300 transition-colors hover:bg-sky-500/20 whitespace-nowrap"
+          >
+            <span>{t('Файлы (SFTP)', 'SFTP Files')}</span>
+            <ArrowUpRight className="h-3.5 w-3.5" />
+          </Link>
+
+          <Link
             to={`/metrics?serverId=${server.id}`}
             className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#1E293B] px-3.5 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-800 whitespace-nowrap"
           >

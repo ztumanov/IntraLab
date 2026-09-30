@@ -3,7 +3,9 @@ import {
   checkAllServers,
   checkServerConnection,
   createServer,
+  createSftpDirectory,
   deleteServer,
+  deleteSftpPath,
   executeSshCommandOnServer,
   fetchHealth,
   fetchServerAgent,
@@ -16,12 +18,15 @@ import {
   fetchServersGeolocation,
   fetchServerSystemLogs,
   fetchServerTelemetry,
+  fetchSftpDirectory,
   installServerAgentViaSsh,
   launchDockerContainer,
+  readSftpFile,
   rotateServerAgentToken,
   stopServerAgentViaSsh,
   triggerDockerContainerAction,
   updateServerCredentials,
+  writeSftpFile,
 } from '../api/servers.ts';
 import {
   CreateServerInput,
@@ -291,3 +296,83 @@ export function useDeleteServer() {
     },
   });
 }
+
+export function useSftpDirectory(serverId: number, path: string) {
+  return useQuery({
+    queryKey: ['servers', serverId, 'sftp', 'list', path],
+    queryFn: () => fetchSftpDirectory(serverId, path),
+    enabled: Number.isInteger(serverId) && serverId > 0 && Boolean(path),
+  });
+}
+
+export function useWriteSftpFile() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      serverId,
+      path,
+      content,
+      encoding,
+      useSudo,
+    }: {
+      serverId: number;
+      path: string;
+      content: string;
+      encoding?: 'utf8' | 'base64';
+      useSudo?: boolean;
+    }) =>
+      writeSftpFile(serverId, {
+        path,
+        content,
+        encoding,
+        use_sudo: useSudo,
+      }),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ['servers', variables.serverId, 'sftp', 'list'],
+      });
+    },
+  });
+}
+
+export function useCreateSftpDirectory() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      serverId,
+      path,
+      useSudo,
+    }: {
+      serverId: number;
+      path: string;
+      useSudo?: boolean;
+    }) => createSftpDirectory(serverId, path, useSudo),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ['servers', variables.serverId, 'sftp', 'list'],
+      });
+    },
+  });
+}
+
+export function useDeleteSftpPath() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      serverId,
+      path,
+      useSudo,
+    }: {
+      serverId: number;
+      path: string;
+      useSudo?: boolean;
+    }) => deleteSftpPath(serverId, path, useSudo),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ['servers', variables.serverId, 'sftp', 'list'],
+      });
+    },
+  });
+}
+
+export { readSftpFile };

@@ -14,6 +14,8 @@ import {
   ServerLogsResponse,
   ServerMonitoringResponse,
   ServerNetworkInspectionResponse,
+  SftpDirectoryListResponse,
+  SftpFileReadResponse,
   SshCommandLog,
   SystemLogSource,
   UpdateCredentialsInput,
@@ -426,6 +428,117 @@ export async function fetchServerMonitoring(
     const body = await response.json().catch(() => ({}));
     throw new ApiRequestError(
       body.error || 'Failed to fetch Prometheus metrics for server',
+      response.status,
+      body.details
+    );
+  }
+  return response.json();
+}
+
+export async function fetchSftpDirectory(
+  serverId: number,
+  path = '/etc'
+): Promise<SftpDirectoryListResponse> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(
+    `/api/servers/${serverId}/sftp/list?path=${encodeURIComponent(path)}`,
+    { headers }
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new ApiRequestError(
+      body.error || 'Failed to list remote directory via SFTP',
+      response.status,
+      body.details
+    );
+  }
+  return response.json();
+}
+
+export async function readSftpFile(
+  serverId: number,
+  path: string,
+  useSudo = false
+): Promise<SftpFileReadResponse> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(
+    `/api/servers/${serverId}/sftp/read?path=${encodeURIComponent(path)}&sudo=${useSudo ? 'true' : 'false'}`,
+    { headers }
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new ApiRequestError(
+      body.error || 'Failed to read remote file via SFTP',
+      response.status,
+      body.details
+    );
+  }
+  return response.json();
+}
+
+export async function writeSftpFile(
+  serverId: number,
+  params: {
+    path: string;
+    content: string;
+    encoding?: 'utf8' | 'base64';
+    use_sudo?: boolean;
+  }
+): Promise<{ path: string; size: number; updated_at: string }> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`/api/servers/${serverId}/sftp/write`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(params),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new ApiRequestError(
+      body.error || 'Failed to write remote file via SFTP',
+      response.status,
+      body.details
+    );
+  }
+  return response.json();
+}
+
+export async function createSftpDirectory(
+  serverId: number,
+  path: string,
+  useSudo = false
+): Promise<{ path: string; created_at: string }> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`/api/servers/${serverId}/sftp/mkdir`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ path, use_sudo: useSudo }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new ApiRequestError(
+      body.error || 'Failed to create remote directory',
+      response.status,
+      body.details
+    );
+  }
+  return response.json();
+}
+
+export async function deleteSftpPath(
+  serverId: number,
+  path: string,
+  useSudo = false
+): Promise<{ deleted_path: string }> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`/api/servers/${serverId}/sftp/delete`, {
+    method: 'DELETE',
+    headers,
+    body: JSON.stringify({ path, use_sudo: useSudo }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new ApiRequestError(
+      body.error || 'Failed to delete remote path',
       response.status,
       body.details
     );

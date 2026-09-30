@@ -22,6 +22,7 @@ import { MetricsPage } from './pages/MetricsPage.tsx';
 import { LogsPage } from './pages/LogsPage.tsx';
 import { AlertsPage } from './pages/AlertsPage.tsx';
 import { SettingsPage } from './pages/SettingsPage.tsx';
+import { SftpFileManagerPage } from './pages/SftpFileManagerPage.tsx';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -65,6 +66,7 @@ const AppRoutes: React.FC = () => {
         <Route path="/networks" element={<NetworksPage />} />
         <Route path="/containers" element={<ContainersPage />} />
         <Route path="/deployments" element={<DeploymentsPage />} />
+        <Route path="/files" element={<SftpFileManagerPage />} />
         <Route path="/metrics" element={<MetricsPage />} />
         <Route path="/logs" element={<LogsPage />} />
         <Route path="/alerts" element={<AlertsPage />} />
