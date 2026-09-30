@@ -5,6 +5,13 @@ export const users = pgTable('users', {
   id: serial('id').primaryKey(),
   uid: text('uid').notNull().unique(),
   email: text('email').notNull(),
+  username: text('username').default('').notNull(),
+  passwordHash: text('password_hash').default('').notNull(),
+  authProvider: text('auth_provider').default('local').notNull(),
+  totpEnabled: integer('totp_enabled').default(0).notNull(),
+  totpSecretEncrypted: text('totp_secret_encrypted').default('').notNull(),
+  totpPendingSecretEncrypted: text('totp_pending_secret_encrypted').default('').notNull(),
+  recoveryCodesHashes: text('recovery_codes_hashes').default('[]').notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

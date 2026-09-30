@@ -4,9 +4,10 @@ import { WebSocketServer, WebSocket } from 'ws';
 import ssh2 from 'ssh2';
 import type { ConnectConfig, ClientChannel } from 'ssh2';
 import { adminAuth } from '../lib/firebase-admin.ts';
-import { getOrCreateUser } from '../db/users.ts';
+import { findUserByUid, getOrCreateUser } from '../db/users.ts';
 import { getServerById } from '../db/servers.ts';
 import { decryptSecret } from './sshConnector.ts';
+import { verifyLocalSessionToken } from './localAuth.ts';
 
 const { Client: SshClient } = ssh2;
 
@@ -30,17 +31,29 @@ async function verifyWsToken(token: string): Promise<{ uid: string; email: strin
   const clean = (token || '').trim();
   if (!clean) return null;
 
+  if (clean.startsWith('ila_sess.')) {
+    const localPayload = verifyLocalSessionToken(clean);
+    if (!localPayload) return null;
+    const dbUser = await findUserByUid(localPayload.uid);
+    const email = dbUser?.email || localPayload.email;
+    if (!dbUser) {
+      await getOrCreateUser(localPayload.uid, email, 'local');
+    }
+    return { uid: localPayload.uid, email };
+  }
+
   if (clean === SELF_HOSTED_OPERATOR_TOKEN) {
     const uid = 'infralab-local-operator';
-    const email = process.env.OPERATOR_EMAIL || 'operator@infralab.local';
-    await getOrCreateUser(uid, email);
+    const email =
+      process.env.ADMIN_EMAIL || process.env.OPERATOR_EMAIL || 'admin@infralab.local';
+    await getOrCreateUser(uid, email, 'local');
     return { uid, email };
   }
 
   try {
     const decoded = await adminAuth.verifyIdToken(clean);
     const email = decoded.email || `${decoded.uid}@infralab.local`;
-    await getOrCreateUser(decoded.uid, email);
+    await getOrCreateUser(decoded.uid, email, 'google');
     return { uid: decoded.uid, email };
   } catch {
     return null;

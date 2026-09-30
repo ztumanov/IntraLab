@@ -56,8 +56,12 @@ services:
       SQL_PASSWORD: ${POSTGRES_PASSWORD:-infralab_secret}
       SQL_DB_NAME: ${POSTGRES_DB:-infralab}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-infralab-aes256-gcm-master-secret-key-2026}
+      SESSION_SECRET: ${SESSION_SECRET:-infralab-self-hosted-hmac-session-secret-2026}
       PROMETHEUS_URL: http://prometheus:9090
-      OPERATOR_EMAIL: ${OPERATOR_EMAIL:-operator@infralab.local}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@infralab.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-InfraLab!2026}
+      OPERATOR_EMAIL: ${OPERATOR_EMAIL:-admin@infralab.local}
     ports:
       - "${APP_PORT:-3000}:3000"
 

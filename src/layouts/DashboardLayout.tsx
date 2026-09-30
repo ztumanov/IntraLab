@@ -1,6 +1,21 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
-import { Plus } from 'lucide-react';
+import {
+  Activity,
+  Bell,
+  Box,
+  FileText,
+  Globe,
+  LayoutDashboard,
+  Network,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
+  Rocket,
+  Server,
+  Settings,
+  Terminal,
+} from 'lucide-react';
 import { useAuth } from '../context/AuthContext.tsx';
 import { useI18n } from '../context/I18nContext.tsx';
 import { AddServerModal } from '../components/AddServerModal.tsx';
@@ -9,19 +24,22 @@ interface NavItem {
   labelRu: string;
   labelEn: string;
   to: string;
+  icon: React.ComponentType<{ className?: string }>;
   activeModule: boolean;
 }
 
+const SIDEBAR_STORAGE_KEY = 'infralab_sidebar_collapsed';
+
 const PRIMARY_NAV_ITEMS: NavItem[] = [
-  { labelRu: 'Дашборд', labelEn: 'Dashboard', to: '/dashboard', activeModule: true },
-  { labelRu: 'Серверы', labelEn: 'Servers', to: '/servers', activeModule: true },
-  { labelRu: 'Карта узлов', labelEn: 'Geo Map', to: '/map', activeModule: true },
-  { labelRu: 'Сети', labelEn: 'Networks', to: '/networks', activeModule: true },
-  { labelRu: 'Контейнеры', labelEn: 'Containers', to: '/containers', activeModule: true },
-  { labelRu: 'Развёртывания', labelEn: 'Deployments', to: '/deployments', activeModule: true },
-  { labelRu: 'Метрики', labelEn: 'Metrics', to: '/metrics', activeModule: true },
-  { labelRu: 'Логи', labelEn: 'Logs', to: '/logs', activeModule: true },
-  { labelRu: 'Оповещения', labelEn: 'Alerts', to: '/alerts', activeModule: true },
+  { labelRu: 'Дашборд', labelEn: 'Dashboard', to: '/dashboard', icon: LayoutDashboard, activeModule: true },
+  { labelRu: 'Серверы', labelEn: 'Servers', to: '/servers', icon: Server, activeModule: true },
+  { labelRu: 'Карта узлов', labelEn: 'Geo Map', to: '/map', icon: Globe, activeModule: true },
+  { labelRu: 'Сети', labelEn: 'Networks', to: '/networks', icon: Network, activeModule: true },
+  { labelRu: 'Контейнеры', labelEn: 'Containers', to: '/containers', icon: Box, activeModule: true },
+  { labelRu: 'Развёртывания', labelEn: 'Deployments', to: '/deployments', icon: Rocket, activeModule: true },
+  { labelRu: 'Метрики', labelEn: 'Metrics', to: '/metrics', icon: Activity, activeModule: true },
+  { labelRu: 'Логи', labelEn: 'Logs', to: '/logs', icon: FileText, activeModule: true },
+  { labelRu: 'Оповещения', labelEn: 'Alerts', to: '/alerts', icon: Bell, activeModule: true },
 ];
 
 export const DashboardLayout: React.FC = () => {
@@ -29,6 +47,25 @@ export const DashboardLayout: React.FC = () => {
   const { locale, setLocale, t } = useI18n();
   const location = useLocation();
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(SIDEBAR_STORAGE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_STORAGE_KEY, String(isSidebarCollapsed));
+    } catch {
+      // Ignore storage errors
+    }
+  }, [isSidebarCollapsed]);
+
+  const toggleSidebar = () => {
+    setIsSidebarCollapsed((prev) => !prev);
+  };
 
   const getBreadcrumbLabel = () => {
     const path = location.pathname;
@@ -53,49 +90,128 @@ export const DashboardLayout: React.FC = () => {
   return (
     <div className="flex min-h-screen bg-[#0F172A] text-slate-100">
       {/* Sidebar */}
-      <aside className="hidden w-64 shrink-0 flex-col justify-between border-r border-slate-800 bg-[#0F172A] md:flex">
+      <aside
+        className={`hidden shrink-0 flex-col justify-between border-r border-slate-800 bg-[#0F172A] transition-all duration-200 md:flex ${
+          isSidebarCollapsed ? 'w-16' : 'w-64'
+        }`}
+      >
         <div>
-          <div className="flex h-16 items-center border-b border-slate-800 px-6">
-            <Link
-              to="/dashboard"
-              className="text-lg font-semibold tracking-tight text-slate-100"
-            >
-              InfraLab
-            </Link>
+          <div
+            className={`flex h-16 items-center border-b border-slate-800 ${
+              isSidebarCollapsed ? 'justify-center px-2' : 'justify-between px-4'
+            }`}
+          >
+            {!isSidebarCollapsed ? (
+              <>
+                <Link
+                  to="/dashboard"
+                  className="flex items-center gap-2.5 text-lg font-semibold tracking-tight text-slate-100"
+                >
+                  <span className="flex h-7 w-7 items-center justify-center rounded-md bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
+                    <Terminal className="h-4 w-4" />
+                  </span>
+                  <span>InfraLab</span>
+                </Link>
+                <button
+                  type="button"
+                  onClick={toggleSidebar}
+                  title={t('Свернуть боковое меню', 'Collapse sidebar')}
+                  aria-label={t('Свернуть боковое меню', 'Collapse sidebar')}
+                  className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-slate-800/70 hover:text-slate-100"
+                >
+                  <PanelLeftClose className="h-4 w-4" />
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={toggleSidebar}
+                title={t('Развернуть боковое меню', 'Expand sidebar')}
+                aria-label={t('Развернуть боковое меню', 'Expand sidebar')}
+                className="flex h-9 w-9 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-slate-800/70 hover:text-emerald-400"
+              >
+                <PanelLeftOpen className="h-4 w-4" />
+              </button>
+            )}
           </div>
 
-          <nav className="space-y-1 px-3 py-4" aria-label="Sidebar Navigation">
-            {PRIMARY_NAV_ITEMS.map((item) => (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                className={({ isActive }) =>
-                  `flex items-center justify-between rounded-md px-3 py-2 text-sm font-medium transition-colors whitespace-nowrap ${
-                    isActive
-                      ? 'bg-slate-800/90 text-white'
-                      : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
-                  }`
-                }
-              >
-                <span>{locale === 'ru' ? item.labelRu : item.labelEn}</span>
-              </NavLink>
-            ))}
+          <nav
+            className={`space-y-1 py-4 ${isSidebarCollapsed ? 'px-2' : 'px-3'}`}
+            aria-label="Sidebar Navigation"
+          >
+            {PRIMARY_NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const label = locale === 'ru' ? item.labelRu : item.labelEn;
+              return (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  title={isSidebarCollapsed ? label : undefined}
+                  aria-label={label}
+                  className={({ isActive }) =>
+                    `group relative flex items-center rounded-md text-sm font-medium transition-colors whitespace-nowrap ${
+                      isSidebarCollapsed
+                        ? 'justify-center px-0 py-2.5'
+                        : 'justify-start gap-3 px-3 py-2'
+                    } ${
+                      isActive
+                        ? 'bg-slate-800/90 text-white'
+                        : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
+                    }`
+                  }
+                >
+                  <Icon className="h-4 w-4 shrink-0" />
+                  {!isSidebarCollapsed && <span className="truncate">{label}</span>}
+                </NavLink>
+              );
+            })}
           </nav>
         </div>
 
-        <div className="border-t border-slate-800 p-3">
+        <div className={`border-t border-slate-800 space-y-1 ${isSidebarCollapsed ? 'p-2' : 'p-3'}`}>
           <NavLink
             to="/settings"
+            title={isSidebarCollapsed ? t('Настройки', 'Settings') : undefined}
+            aria-label={t('Настройки', 'Settings')}
             className={({ isActive }) =>
-              `flex items-center justify-between rounded-md px-3 py-2 text-sm font-medium transition-colors whitespace-nowrap ${
+              `flex items-center rounded-md text-sm font-medium transition-colors whitespace-nowrap ${
+                isSidebarCollapsed
+                  ? 'justify-center px-0 py-2.5'
+                  : 'justify-start gap-3 px-3 py-2'
+              } ${
                 isActive
                   ? 'bg-slate-800/90 text-white'
                   : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
               }`
             }
           >
-            <span>{t('Настройки', 'Settings')}</span>
+            <Settings className="h-4 w-4 shrink-0" />
+            {!isSidebarCollapsed && <span>{t('Настройки', 'Settings')}</span>}
           </NavLink>
+
+          <button
+            type="button"
+            onClick={toggleSidebar}
+            title={
+              isSidebarCollapsed
+                ? t('Развернуть меню', 'Expand sidebar')
+                : t('Компактный режим (только иконки)', 'Compact mode (icons only)')
+            }
+            className={`flex w-full items-center rounded-md text-xs font-medium text-slate-500 transition-colors hover:bg-slate-800/40 hover:text-slate-300 whitespace-nowrap ${
+              isSidebarCollapsed
+                ? 'justify-center px-0 py-2'
+                : 'justify-start gap-3 px-3 py-2'
+            }`}
+          >
+            {isSidebarCollapsed ? (
+              <PanelLeftOpen className="h-4 w-4 shrink-0" />
+            ) : (
+              <>
+                <PanelLeftClose className="h-4 w-4 shrink-0" />
+                <span>{t('Свернуть меню', 'Collapse menu')}</span>
+              </>
+            )}
+          </button>
         </div>
       </aside>
 

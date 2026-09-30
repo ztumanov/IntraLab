@@ -1,12 +1,31 @@
 import { pool } from './index.ts';
+import { hashPassword } from '../server/localAuth.ts';
 
 const BOOTSTRAP_SQL = `
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
   uid TEXT NOT NULL UNIQUE,
   email TEXT NOT NULL,
+  username TEXT NOT NULL DEFAULT '',
+  password_hash TEXT NOT NULL DEFAULT '',
+  auth_provider TEXT NOT NULL DEFAULT 'local',
+  totp_enabled INTEGER NOT NULL DEFAULT 0,
+  totp_secret_encrypted TEXT NOT NULL DEFAULT '',
+  totp_pending_secret_encrypted TEXT NOT NULL DEFAULT '',
+  recovery_codes_hashes TEXT NOT NULL DEFAULT '[]',
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret_encrypted TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_pending_secret_encrypted TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_codes_hashes TEXT NOT NULL DEFAULT '[]';
+
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 
 CREATE TABLE IF NOT EXISTS servers (
   id SERIAL PRIMARY KEY,
@@ -83,10 +102,63 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 `;
 
+export const DEFAULT_LOCAL_ADMIN_UID = 'infralab-local-operator';
+export const DEFAULT_LOCAL_ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+export const DEFAULT_LOCAL_ADMIN_EMAIL =
+  process.env.ADMIN_EMAIL || process.env.OPERATOR_EMAIL || 'admin@infralab.local';
+export const DEFAULT_LOCAL_ADMIN_PASSWORD =
+  process.env.ADMIN_PASSWORD || 'InfraLab!2026';
+
+export async function seedDefaultLocalAdmin(): Promise<void> {
+  try {
+    const existing = await pool.query(
+      'SELECT uid, username, password_hash FROM users WHERE uid = $1 OR lower(username) = lower($2) LIMIT 1',
+      [DEFAULT_LOCAL_ADMIN_UID, DEFAULT_LOCAL_ADMIN_USERNAME]
+    );
+
+    if (existing.rows.length === 0) {
+      const passwordHash = hashPassword(DEFAULT_LOCAL_ADMIN_PASSWORD);
+      await pool.query(
+        `INSERT INTO users (uid, email, username, password_hash, auth_provider, totp_enabled)
+         VALUES ($1, $2, $3, $4, 'local', 0)
+         ON CONFLICT (uid) DO NOTHING`,
+        [
+          DEFAULT_LOCAL_ADMIN_UID,
+          DEFAULT_LOCAL_ADMIN_EMAIL,
+          DEFAULT_LOCAL_ADMIN_USERNAME,
+          passwordHash,
+        ]
+      );
+    } else {
+      const row = existing.rows[0];
+      if (!row.password_hash) {
+        const passwordHash = hashPassword(DEFAULT_LOCAL_ADMIN_PASSWORD);
+        await pool.query(
+          `UPDATE users
+           SET username = CASE WHEN username = '' THEN $2 ELSE username END,
+               email = $3,
+               password_hash = $4,
+               auth_provider = 'local'
+           WHERE uid = $1`,
+          [
+            row.uid,
+            DEFAULT_LOCAL_ADMIN_USERNAME,
+            DEFAULT_LOCAL_ADMIN_EMAIL,
+            passwordHash,
+          ]
+        );
+      }
+    }
+  } catch (err) {
+    console.error('Default admin user seed warning:', err);
+  }
+}
+
 export async function ensureDatabaseSchema(): Promise<void> {
   try {
     await pool.query(BOOTSTRAP_SQL);
-  } catch (err) {
-    console.error('Database schema auto-bootstrap warning:', err);
+  } catch {
+    // In managed Cloud SQL, DDL is applied via migrations/UpdateSchema; proceed to seed admin
   }
+  await seedDefaultLocalAdmin();
 }

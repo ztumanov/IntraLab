@@ -33,6 +33,7 @@ import {
 import { validateCreateServerPayload } from './src/lib/validation.ts';
 import {
   encryptSecret,
+  decryptSecret,
   executeSshCommand,
   fetchDockerContainerLogs,
   fetchSystemLogsOverSsh,
@@ -42,6 +43,29 @@ import {
   probeSshServer,
   runDockerContainerOnServer,
 } from './src/server/sshConnector.ts';
+import {
+  activateUserTotp,
+  createLocalUserAccount,
+  disableUserTotp,
+  findLocalUserByIdentifier,
+  findUserByUid,
+  savePendingTotpSecret,
+  updateUserPasswordHash,
+  updateUserRecoveryCodes,
+} from './src/db/users.ts';
+import {
+  buildOtpAuthUri,
+  generateRecoveryCodes,
+  generateTotpQrDataUrl,
+  generateTotpSecret,
+  hashPassword,
+  signLocalSessionToken,
+  signPre2faToken,
+  verifyAndConsumeRecoveryCode,
+  verifyPassword,
+  verifyPre2faToken,
+  verifyTotpCode,
+} from './src/server/localAuth.ts';
 import type {
   DockerContainerAction,
   ServerGeoLocation,
@@ -341,6 +365,353 @@ export function createApp() {
       service: 'infralab-api',
       timestamp: new Date().toISOString(),
     });
+  });
+
+  // --- Local Authentication & 2FA TOTP Endpoints ---
+
+  app.post('/api/auth/local/login', async (req, res) => {
+    try {
+      const identifier = String(req.body?.identifier || '').trim();
+      const password = String(req.body?.password || '');
+      if (!identifier || !password) {
+        return res.status(400).json({ error: 'Введите логин (или email) и пароль' });
+      }
+
+      const user = await findLocalUserByIdentifier(identifier);
+      if (!user || !user.passwordHash || !verifyPassword(password, user.passwordHash)) {
+        return res.status(401).json({ error: 'Неверный логин или пароль' });
+      }
+
+      const username = user.username || user.email.split('@')[0];
+
+      if (user.totpEnabled === 1 && user.totpSecretEncrypted) {
+        const preAuthToken = signPre2faToken({
+          uid: user.uid,
+          email: user.email,
+          username,
+        });
+        return res.status(200).json({
+          requires_2fa: true,
+          pre_auth_token: preAuthToken,
+          email: user.email,
+          username,
+        });
+      }
+
+      const token = signLocalSessionToken({
+        uid: user.uid,
+        email: user.email,
+        username,
+      });
+
+      return res.status(200).json({
+        requires_2fa: false,
+        token,
+        user: {
+          uid: user.uid,
+          email: user.email,
+          username,
+          totp_enabled: user.totpEnabled === 1,
+          auth_provider: 'local',
+        },
+      });
+    } catch (error: any) {
+      console.error('POST /api/auth/local/login failed:', error);
+      return res.status(500).json({ error: error.message || 'Ошибка входа' });
+    }
+  });
+
+  app.post('/api/auth/local/verify-2fa', async (req, res) => {
+    try {
+      const preAuthToken = String(req.body?.pre_auth_token || '').trim();
+      const code = String(req.body?.code || '').trim();
+      if (!preAuthToken || !code) {
+        return res.status(400).json({ error: 'Введите 6-значный код 2FA или резервный код' });
+      }
+
+      const prePayload = verifyPre2faToken(preAuthToken);
+      if (!prePayload) {
+        return res.status(401).json({
+          error: 'Сессия проверки 2FA истекла. Пожалуйста, введите пароль заново.',
+        });
+      }
+
+      const user = await findUserByUid(prePayload.uid);
+      if (!user || user.totpEnabled !== 1 || !user.totpSecretEncrypted) {
+        return res.status(400).json({ error: '2FA не настроена для данного пользователя' });
+      }
+
+      const totpSecret = decryptSecret(user.totpSecretEncrypted);
+      const isTotpValid = verifyTotpCode(totpSecret, code);
+      let usedRecoveryCode = false;
+
+      if (!isTotpValid) {
+        const recoveryCheck = verifyAndConsumeRecoveryCode(code, user.recoveryCodesHashes);
+        if (!recoveryCheck.valid) {
+          return res.status(401).json({
+            error: 'Неверный код 2FA (TOTP) или резервный код восстановления',
+          });
+        }
+        usedRecoveryCode = true;
+        await updateUserRecoveryCodes(user.uid, recoveryCheck.remainingHashesJson);
+      }
+
+      const username = user.username || user.email.split('@')[0];
+      const sessionToken = signLocalSessionToken({
+        uid: user.uid,
+        email: user.email,
+        username,
+      });
+
+      return res.status(200).json({
+        token: sessionToken,
+        used_recovery_code: usedRecoveryCode,
+        user: {
+          uid: user.uid,
+          email: user.email,
+          username,
+          totp_enabled: true,
+          auth_provider: 'local',
+        },
+      });
+    } catch (error: any) {
+      console.error('POST /api/auth/local/verify-2fa failed:', error);
+      return res.status(500).json({ error: error.message || 'Ошибка проверки 2FA' });
+    }
+  });
+
+  app.post('/api/auth/local/register', async (req, res) => {
+    try {
+      const username = String(req.body?.username || '').trim();
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const password = String(req.body?.password || '');
+
+      if (!username || username.length < 3 || !/^[a-zA-Z0-9_.-]+$/.test(username)) {
+        return res.status(400).json({
+          error: 'Имя пользователя должно содержать минимум 3 символа (латиница, цифры, _.-)',
+        });
+      }
+      if (!email || !email.includes('@')) {
+        return res.status(400).json({ error: 'Укажите корректный email' });
+      }
+      if (!password || password.length < 6) {
+        return res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
+      }
+
+      const existingByUsername = await findLocalUserByIdentifier(username);
+      if (existingByUsername) {
+        return res.status(409).json({ error: 'Пользователь с таким логином уже существует' });
+      }
+      const existingByEmail = await findLocalUserByIdentifier(email);
+      if (existingByEmail) {
+        return res.status(409).json({ error: 'Пользователь с таким email уже существует' });
+      }
+
+      const passwordHash = hashPassword(password);
+      const created = await createLocalUserAccount({
+        username,
+        email,
+        passwordHash,
+      });
+
+      const token = signLocalSessionToken({
+        uid: created.uid,
+        email: created.email,
+        username: created.username,
+      });
+
+      return res.status(201).json({
+        token,
+        user: {
+          uid: created.uid,
+          email: created.email,
+          username: created.username,
+          totp_enabled: false,
+          auth_provider: 'local',
+        },
+      });
+    } catch (error: any) {
+      console.error('POST /api/auth/local/register failed:', error);
+      return res.status(500).json({ error: error.message || 'Ошибка регистрации' });
+    }
+  });
+
+  app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const user = await findUserByUid(uid);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      let recoveryCodesRemaining = 0;
+      try {
+        const parsed = JSON.parse(user.recoveryCodesHashes || '[]');
+        if (Array.isArray(parsed)) {
+          recoveryCodesRemaining = parsed.length;
+        }
+      } catch {
+        recoveryCodesRemaining = 0;
+      }
+
+      return res.status(200).json({
+        uid: user.uid,
+        email: user.email,
+        username: user.username || user.email.split('@')[0],
+        auth_provider: user.authProvider || 'local',
+        has_local_password: Boolean(user.passwordHash),
+        totp_enabled: user.totpEnabled === 1,
+        recovery_codes_remaining: recoveryCodesRemaining,
+      });
+    } catch (error: any) {
+      console.error('GET /api/auth/me failed:', error);
+      return res.status(500).json({ error: error.message || 'Failed to load profile' });
+    }
+  });
+
+  app.post('/api/auth/2fa/setup', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const user = await findUserByUid(uid);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const secret = generateTotpSecret(20);
+      const encryptedPending = encryptSecret(secret);
+      await savePendingTotpSecret(uid, encryptedPending);
+
+      const accountName = user.email || user.username || uid;
+      const otpauthUri = buildOtpAuthUri({
+        secret,
+        accountName,
+        issuer: 'InfraLab',
+      });
+      const qrDataUrl = await generateTotpQrDataUrl(otpauthUri);
+
+      return res.status(200).json({
+        secret,
+        otpauth_uri: otpauthUri,
+        qr_data_url: qrDataUrl,
+        issuer: 'InfraLab',
+        account: accountName,
+      });
+    } catch (error: any) {
+      console.error('POST /api/auth/2fa/setup failed:', error);
+      return res.status(500).json({ error: error.message || 'Не удалось инициализировать 2FA' });
+    }
+  });
+
+  app.post('/api/auth/2fa/enable', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const code = String(req.body?.code || '').trim();
+      if (!code) {
+        return res.status(400).json({ error: 'Введите 6-значный код из приложения-аутентификатора' });
+      }
+
+      const user = await findUserByUid(uid);
+      if (!user || !user.totpPendingSecretEncrypted) {
+        return res.status(400).json({
+          error: 'Сначала запросите генерацию QR-кода и секрета 2FA',
+        });
+      }
+
+      const pendingSecret = decryptSecret(user.totpPendingSecretEncrypted);
+      if (!verifyTotpCode(pendingSecret, code)) {
+        return res.status(400).json({
+          error: 'Неверный 6-значный код. Проверьте синхронизацию времени на устройстве.',
+        });
+      }
+
+      const { plainCodes, hashedCodesJson } = generateRecoveryCodes(8);
+      await activateUserTotp(uid, user.totpPendingSecretEncrypted, hashedCodesJson);
+
+      return res.status(200).json({
+        totp_enabled: true,
+        recovery_codes: plainCodes,
+      });
+    } catch (error: any) {
+      console.error('POST /api/auth/2fa/enable failed:', error);
+      return res.status(500).json({ error: error.message || 'Не удалось включить 2FA' });
+    }
+  });
+
+  app.post('/api/auth/2fa/disable', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const verification = String(req.body?.code || '').trim();
+      if (!verification) {
+        return res.status(400).json({
+          error: 'Для отключения 2FA введите текущий 6-значный код TOTP или пароль от аккаунта',
+        });
+      }
+
+      const user = await findUserByUid(uid);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      let verified = false;
+      if (user.totpSecretEncrypted) {
+        const secret = decryptSecret(user.totpSecretEncrypted);
+        if (verifyTotpCode(secret, verification)) {
+          verified = true;
+        }
+      }
+      if (!verified && user.passwordHash && verifyPassword(verification, user.passwordHash)) {
+        verified = true;
+      }
+      if (!verified && user.recoveryCodesHashes) {
+        const rec = verifyAndConsumeRecoveryCode(verification, user.recoveryCodesHashes);
+        if (rec.valid) {
+          verified = true;
+        }
+      }
+
+      if (!verified) {
+        return res.status(401).json({
+          error: 'Неверный код 2FA или пароль',
+        });
+      }
+
+      await disableUserTotp(uid);
+      return res.status(200).json({ totp_enabled: false });
+    } catch (error: any) {
+      console.error('POST /api/auth/2fa/disable failed:', error);
+      return res.status(500).json({ error: error.message || 'Не удалось отключить 2FA' });
+    }
+  });
+
+  app.post('/api/auth/password', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const currentPassword = String(req.body?.current_password || '');
+      const newPassword = String(req.body?.new_password || '');
+
+      if (!newPassword || newPassword.length < 6) {
+        return res.status(400).json({
+          error: 'Новый пароль должен содержать минимум 6 символов',
+        });
+      }
+
+      const user = await findUserByUid(uid);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      if (user.passwordHash && !verifyPassword(currentPassword, user.passwordHash)) {
+        return res.status(401).json({ error: 'Текущий пароль указан неверно' });
+      }
+
+      const newHash = hashPassword(newPassword);
+      await updateUserPasswordHash(uid, newHash);
+
+      return res.status(200).json({ updated: true });
+    } catch (error: any) {
+      console.error('POST /api/auth/password failed:', error);
+      return res.status(500).json({ error: error.message || 'Не удалось обновить пароль' });
+    }
   });
 
   app.get('/api/servers', requireAuth, async (req: AuthRequest, res) => {

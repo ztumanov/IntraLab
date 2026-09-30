@@ -2,6 +2,11 @@ import { and, desc, eq } from 'drizzle-orm';
 import { db } from './index.ts';
 import { serverMetrics, servers, sshCommandLogs } from './schema.ts';
 import { SshProbeResult } from '../server/sshConnector.ts';
+import { DEFAULT_LOCAL_ADMIN_UID } from './bootstrap.ts';
+
+function isLocalAdmin(userUid: string): boolean {
+  return userUid === DEFAULT_LOCAL_ADMIN_UID;
+}
 
 export interface CreateServerRecordInput {
   userUid: string;
@@ -17,6 +22,9 @@ export interface CreateServerRecordInput {
 
 export async function listServersByUser(userUid: string) {
   try {
+    if (isLocalAdmin(userUid)) {
+      return await db.select().from(servers).orderBy(desc(servers.createdAt));
+    }
     return await db
       .select()
       .from(servers)
@@ -33,7 +41,11 @@ export async function getServerById(id: number, userUid: string) {
     const rows = await db
       .select()
       .from(servers)
-      .where(and(eq(servers.id, id), eq(servers.userUid, userUid)));
+      .where(
+        isLocalAdmin(userUid)
+          ? eq(servers.id, id)
+          : and(eq(servers.id, id), eq(servers.userUid, userUid))
+      );
     return rows[0] ?? null;
   } catch (error) {
     console.error('Database query failed in getServerById:', error);
@@ -94,7 +106,11 @@ export async function updateServerCredentialsRecord(params: {
     const rows = await db
       .update(servers)
       .set(updatePayload)
-      .where(and(eq(servers.id, params.id), eq(servers.userUid, params.userUid)))
+      .where(
+        isLocalAdmin(params.userUid)
+          ? eq(servers.id, params.id)
+          : and(eq(servers.id, params.id), eq(servers.userUid, params.userUid))
+      )
       .returning();
     return rows[0] ?? null;
   } catch (error) {
@@ -219,7 +235,11 @@ export async function updateServerProbeResult(params: {
         uptimeInfo: params.probe.uptimeInfo,
         updatedAt: now,
       })
-      .where(and(eq(servers.id, params.id), eq(servers.userUid, params.userUid)))
+      .where(
+        isLocalAdmin(params.userUid)
+          ? eq(servers.id, params.id)
+          : and(eq(servers.id, params.id), eq(servers.userUid, params.userUid))
+      )
       .returning();
 
     const updated = rows[0] ?? null;
@@ -240,7 +260,11 @@ export async function deleteServerById(id: number, userUid: string) {
   try {
     const rows = await db
       .delete(servers)
-      .where(and(eq(servers.id, id), eq(servers.userUid, userUid)))
+      .where(
+        isLocalAdmin(userUid)
+          ? eq(servers.id, id)
+          : and(eq(servers.id, id), eq(servers.userUid, userUid))
+      )
       .returning();
     return rows.length > 0;
   } catch (error) {
@@ -284,7 +308,9 @@ export async function listCommandLogsByServer(serverId: number, userUid: string,
       .select()
       .from(sshCommandLogs)
       .where(
-        and(eq(sshCommandLogs.serverId, serverId), eq(sshCommandLogs.userUid, userUid))
+        isLocalAdmin(userUid)
+          ? eq(sshCommandLogs.serverId, serverId)
+          : and(eq(sshCommandLogs.serverId, serverId), eq(sshCommandLogs.userUid, userUid))
       )
       .orderBy(desc(sshCommandLogs.executedAt))
       .limit(limit);
