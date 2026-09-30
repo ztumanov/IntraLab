@@ -23,6 +23,7 @@ import {
   useCheckServerConnection,
   useDeleteServer,
   useExecuteSshCommand,
+  useInstallServerAgentViaSsh,
   useRotateServerAgentToken,
   useServer,
   useServerAgent,
@@ -68,10 +69,13 @@ export const ServerDetailsPage: React.FC = () => {
   const credentialsMutation = useUpdateServerCredentials();
   const execMutation = useExecuteSshCommand();
   const rotateTokenMutation = useRotateServerAgentToken();
+  const installAgentSshMutation = useInstallServerAgentViaSsh();
   const { t } = useI18n();
 
   const [copiedSsh, setCopiedSsh] = useState(false);
   const [copiedEnroll, setCopiedEnroll] = useState(false);
+  const [agentInstallMsg, setAgentInstallMsg] = useState<string | null>(null);
+  const [agentInstallErr, setAgentInstallErr] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showCredsPanel, setShowCredsPanel] = useState(false);
   const [authType, setAuthType] = useState<SshAuthType>('password');
@@ -690,7 +694,44 @@ export const ServerDetailsPage: React.FC = () => {
             </h2>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <button
+              type="button"
+              onClick={async () => {
+                setAgentInstallMsg(null);
+                setAgentInstallErr(null);
+                try {
+                  const res = await installAgentSshMutation.mutateAsync(server.id);
+                  setAgentInstallMsg(
+                    t(
+                      `Агент ${res.agent_id} успешно установлен в /usr/local/bin/infralab-agent по SSH и запущен на :9101/metrics`,
+                      `Agent ${res.agent_id} installed to /usr/local/bin/infralab-agent via SSH and started on :9101/metrics`
+                    )
+                  );
+                } catch (err: any) {
+                  setAgentInstallErr(
+                    err?.message ||
+                      t('Не удалось установить агент по SSH', 'Failed to install agent via SSH')
+                  );
+                }
+              }}
+              disabled={installAgentSshMutation.isPending || !server.has_secret}
+              className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-50"
+            >
+              <Play
+                className={`h-3.5 w-3.5 ${
+                  installAgentSshMutation.isPending ? 'animate-spin' : ''
+                }`}
+              />
+              <span>
+                {installAgentSshMutation.isPending
+                  ? t('Установка по SSH...', 'Installing via SSH...')
+                  : agentInfo?.status === 'ONLINE'
+                  ? t('Переустановить агент по SSH', 'Reinstall Agent via SSH')
+                  : t('Установить агент по SSH в 1 клик', '1-Click Install Agent via SSH')}
+              </span>
+            </button>
+
             <Link
               to={`/servers/${server.id}/monitoring`}
               className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 font-mono text-xs text-emerald-300 transition-colors hover:bg-emerald-500/20"
@@ -713,6 +754,17 @@ export const ServerDetailsPage: React.FC = () => {
             <span className="font-mono text-xs text-slate-400">HTTPS · 15s Heartbeat</span>
           </div>
         </div>
+
+        {agentInstallMsg && (
+          <div className="rounded border border-emerald-500/40 bg-emerald-950/30 p-3 text-xs text-emerald-200">
+            {agentInstallMsg}
+          </div>
+        )}
+        {agentInstallErr && (
+          <div className="rounded border border-rose-500/40 bg-rose-950/30 p-3 text-xs text-rose-200">
+            {agentInstallErr}
+          </div>
+        )}
 
         {isAgentLoading ? (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
@@ -826,14 +878,14 @@ export const ServerDetailsPage: React.FC = () => {
                   <div>
                     <p className="text-xs font-semibold text-slate-200">
                       {t(
-                        'Регистрация Linux Agent (Одноразовая команда Enrollment)',
-                        'Enroll Linux Agent (One-Time Enrollment Command)'
+                        'Установка и регистрация Linux Agent (SSH в 1 клик или вручную)',
+                        'Install & Enroll Linux Agent (1-Click SSH or Manual CLI)'
                       )}
                     </p>
                     <p className="mt-0.5 text-xs text-slate-400">
                       {t(
-                        'Выполните эту команду на целевом Linux-сервере для регистрации демона infralab-agent и получения постоянного ключа:',
-                        'Run this command on the target Linux host to enroll infralab-agent and issue a persistent credential:'
+                        'Для тестовой среды AI Studio используйте кнопку «Установить агент по SSH в 1 клик» выше — она сама загрузит /usr/local/bin/infralab-agent на сервер по SSH, настроит systemd и активирует экспортер :9101/metrics. Для собственного Docker-сервера можно также выполнить полную команду установки:',
+                        'In AI Studio preview, use the "1-Click Install Agent via SSH" button above to push /usr/local/bin/infralab-agent over SSH and start the :9101/metrics exporter. On a self-hosted Docker server, you can also run the full install command:'
                       )}
                     </p>
                   </div>
@@ -861,7 +913,7 @@ export const ServerDetailsPage: React.FC = () => {
                             ? window.location.origin
                             : 'https://infralab.example';
                         const token = agentInfo?.enrollment_token || '<TOKEN>';
-                        const cmd = `sudo infralab-agent enroll \\\n  --server ${origin} \\\n  --token ${token}`;
+                        const cmd = `sudo curl -fsSL ${origin}/downloads/infralab-agent -o /usr/local/bin/infralab-agent && \\\nsudo chmod +x /usr/local/bin/infralab-agent && \\\nsudo infralab-agent enroll \\\n  --server ${origin} \\\n  --token ${token}`;
                         navigator.clipboard.writeText(cmd);
                         setCopiedEnroll(true);
                         setTimeout(() => setCopiedEnroll(false), 1800);
@@ -884,7 +936,11 @@ export const ServerDetailsPage: React.FC = () => {
                 </div>
 
                 <pre className="overflow-x-auto rounded border border-slate-800/90 bg-[#0B1120] p-3.5 font-mono text-xs text-emerald-300 leading-relaxed">
-                  {`sudo infralab-agent enroll \\\n  --server ${
+                  {`sudo curl -fsSL ${
+                    typeof window !== 'undefined'
+                      ? window.location.origin
+                      : 'https://infralab.example'
+                  }/downloads/infralab-agent -o /usr/local/bin/infralab-agent && \\\nsudo chmod +x /usr/local/bin/infralab-agent && \\\nsudo infralab-agent enroll \\\n  --server ${
                     typeof window !== 'undefined'
                       ? window.location.origin
                       : 'https://infralab.example'

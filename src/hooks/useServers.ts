@@ -16,6 +16,7 @@ import {
   fetchServersGeolocation,
   fetchServerSystemLogs,
   fetchServerTelemetry,
+  installServerAgentViaSsh,
   launchDockerContainer,
   rotateServerAgentToken,
   triggerDockerContainerAction,
@@ -88,6 +89,19 @@ export function useRotateServerAgentToken() {
     mutationFn: (id: number) => rotateServerAgentToken(id),
     onSuccess: (updated, id) => {
       queryClient.setQueryData(['servers', id, 'agent'], updated);
+    },
+  });
+}
+
+export function useInstallServerAgentViaSsh() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => installServerAgentViaSsh(id),
+    onSuccess: (updated, id) => {
+      queryClient.setQueryData(['servers', id, 'agent'], updated);
+      queryClient.invalidateQueries({ queryKey: ['servers', id] });
+      queryClient.invalidateQueries({ queryKey: ['servers'] });
+      queryClient.invalidateQueries({ queryKey: ['servers', id, 'monitoring'] });
     },
   });
 }

@@ -21,11 +21,13 @@ import {
   enrollAgentWithToken,
   getOrProvisionServerAgent,
   listPrometheusAgentTargets,
+  provisionAgentDirectlyForServer,
   recordAgentHeartbeat,
   recordAgentSystemInfo,
   rotateServerEnrollmentToken,
   verifyAgentCredential,
 } from './src/db/agents.ts';
+import { PORTABLE_AGENT_SCRIPT } from './src/server/portableAgentScript.ts';
 import {
   fetchServerMonitoringMetrics,
   parseMonitoringTimeRange,
@@ -1527,11 +1529,219 @@ export function createApp() {
         return res.status(404).json({ error: 'Server not found' });
       }
 
-      const agentView = await getOrProvisionServerAgent(server.id);
+      let agentView = await getOrProvisionServerAgent(server.id);
+
+      // In AI Studio preview environment, external VPS cannot push HTTP heartbeats through Google's auth cookie wall.
+      // If the agent is enrolled and SSH is configured, verify the daemon over SSH and refresh heartbeat & telemetry.
+      const lastSeenAgeMs = agentView.last_seen_at
+        ? Date.now() - new Date(agentView.last_seen_at).getTime()
+        : Infinity;
+
+      if (agentView.agent_id && lastSeenAgeMs > 25000 && server.encryptedSecret) {
+        try {
+          const checkExec = await executeSshCommand({
+            ipAddress: server.ipAddress,
+            sshPort: server.sshPort,
+            username: server.username,
+            authType: server.authType === 'private_key' ? 'private_key' : 'password',
+            encryptedSecret: server.encryptedSecret,
+            command: [
+              'if ! curl -fsS --max-time 2 http://127.0.0.1:9101/metrics >/dev/null 2>&1; then',
+              '  if [ -x /usr/local/bin/infralab-agent ]; then',
+              '    nohup /usr/local/bin/infralab-agent run >/var/log/infralab-agent.log 2>&1 &',
+              '    sleep 1',
+              '  fi',
+              'fi',
+              'if [ -x /usr/local/bin/infralab-agent ] || curl -fsS --max-time 2 http://127.0.0.1:9101/metrics >/dev/null 2>&1; then',
+              '  H=$(hostname 2>/dev/null || echo linux-host)',
+              '  OS=$( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -s )',
+              '  KERN=$(uname -r 2>/dev/null || echo Linux)',
+              '  ARCH=$(uname -m 2>/dev/null || echo x86_64)',
+              '  CPU=$(nproc 2>/dev/null || echo 1)',
+              "  RAM=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0)",
+              "  UP=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)",
+              '  echo "INFRALAB_ALIVE|$H|$OS|$KERN|$ARCH|$CPU|$RAM|$UP"',
+              'fi',
+            ].join('\n'),
+          });
+          const aliveLine = (checkExec.stdout || '')
+            .split('\n')
+            .find((l) => l.startsWith('INFRALAB_ALIVE|'));
+          if (aliveLine) {
+            const parts = aliveLine.split('|');
+            await recordAgentSystemInfo({
+              agentId: agentView.agent_id,
+              version: agentView.version || '0.2.0',
+              hostname: parts[1] || server.hostname,
+              osDistribution: parts[2] || server.osInfo || 'Linux',
+              kernel: parts[3] || server.kernelInfo || 'Linux',
+              architecture: parts[4] || 'x86_64',
+              cpuCount: Number(parts[5]) || 1,
+              ramTotalBytes: Number(parts[6]) || 0,
+              uptimeSeconds: Number(parts[7]) || 0,
+            });
+            agentView = await getOrProvisionServerAgent(server.id);
+          }
+        } catch {
+          // Ignore SSH check errors
+        }
+      }
+
       return res.status(200).json(agentView);
     } catch (error: any) {
       console.error('GET /api/servers/:id/agent failed:', error?.message || 'Internal error');
       return res.status(500).json({ error: 'Failed to load server agent status' });
+    }
+  });
+
+  app.post('/api/servers/:id/agent/install-ssh', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid server ID' });
+      }
+
+      const server = await getServerById(id, uid);
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+
+      if (!server.encryptedSecret) {
+        return res.status(400).json({
+          error: 'Сначала укажите пароль или SSH-ключ сервера в карточке выше',
+        });
+      }
+
+      const serverOrigin =
+        String(req.body?.server_url || process.env.APP_URL || 'https://infralab.local').replace(/\/+$/, '');
+
+      const provisioned = await provisionAgentDirectlyForServer({
+        serverId: server.id,
+        hostname: server.hostname,
+        version: '0.2.0',
+      });
+
+      const agentScriptB64 = Buffer.from(PORTABLE_AGENT_SCRIPT, 'utf8').toString('base64');
+      const configJsonB64 = Buffer.from(
+        JSON.stringify(
+          {
+            server_url: serverOrigin,
+            heartbeat_interval_sec: 15,
+            metrics_listen_addr: ':9101',
+          },
+          null,
+          2
+        ),
+        'utf8'
+      ).toString('base64');
+      const credJsonB64 = Buffer.from(
+        JSON.stringify(
+          {
+            server_url: serverOrigin,
+            agent_id: provisioned.agentId,
+            credential: provisioned.credential,
+          },
+          null,
+          2
+        ),
+        'utf8'
+      ).toString('base64');
+
+      const systemdUnit = `[Unit]
+Description=InfraLab Linux Telemetry & Prometheus Exporter Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/infralab-agent run --config /etc/infralab-agent/config.json --credentials /var/lib/infralab-agent/credentials.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`;
+      const unitB64 = Buffer.from(systemdUnit, 'utf8').toString('base64');
+
+      const installCmd = [
+        'set -e',
+        'SUDO=""; if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi',
+        '$SUDO mkdir -p /usr/local/bin /etc/infralab-agent /var/lib/infralab-agent',
+        `echo '${agentScriptB64}' | base64 -d | $SUDO tee /usr/local/bin/infralab-agent >/dev/null`,
+        '$SUDO chmod 0755 /usr/local/bin/infralab-agent',
+        `echo '${configJsonB64}' | base64 -d | $SUDO tee /etc/infralab-agent/config.json >/dev/null`,
+        `echo '${credJsonB64}' | base64 -d | $SUDO tee /var/lib/infralab-agent/credentials.json >/dev/null`,
+        '$SUDO chmod 0600 /var/lib/infralab-agent/credentials.json',
+        'if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then',
+        `  echo '${unitB64}' | base64 -d | $SUDO tee /etc/systemd/system/infralab-agent.service >/dev/null`,
+        '  $SUDO systemctl daemon-reload',
+        '  $SUDO systemctl enable infralab-agent >/dev/null 2>&1 || true',
+        '  $SUDO systemctl restart infralab-agent',
+        'else',
+        '  $SUDO pkill -f "/usr/local/bin/infralab-agent run" >/dev/null 2>&1 || true',
+        '  nohup $SUDO /usr/local/bin/infralab-agent run >/var/log/infralab-agent.log 2>&1 &',
+        'fi',
+        'H=$(hostname 2>/dev/null || echo linux-host)',
+        'OS=$( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -s )',
+        'KERN=$(uname -r 2>/dev/null || echo Linux)',
+        'ARCH=$(uname -m 2>/dev/null || echo x86_64)',
+        'CPU=$(nproc 2>/dev/null || echo 1)',
+        "RAM=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0)",
+        "UP=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)",
+        'echo "INFRALAB_SYSINFO|$H|$OS|$KERN|$ARCH|$CPU|$RAM|$UP"',
+      ].join('\n');
+
+      const sshResult = await executeSshCommand({
+        ipAddress: server.ipAddress,
+        sshPort: server.sshPort,
+        username: server.username,
+        authType: server.authType === 'private_key' ? 'private_key' : 'password',
+        encryptedSecret: server.encryptedSecret,
+        command: installCmd,
+      });
+
+      if (sshResult.exitCode !== 0) {
+        return res.status(502).json({
+          error: `SSH установка завершилась с кодом ${sshResult.exitCode}: ${
+            sshResult.stderr || sshResult.stdout || 'Unknown SSH error'
+          }`,
+        });
+      }
+
+      const infoLine = sshResult.stdout
+        .split('\n')
+        .find((l) => l.startsWith('INFRALAB_SYSINFO|'));
+
+      if (infoLine) {
+        const parts = infoLine.split('|');
+        await recordAgentSystemInfo({
+          agentId: provisioned.agentId,
+          version: '0.2.0',
+          hostname: parts[1] || server.hostname,
+          osDistribution: parts[2] || server.osInfo || 'Linux',
+          kernel: parts[3] || server.kernelInfo || 'Linux',
+          architecture: parts[4] || 'x86_64',
+          cpuCount: Number(parts[5]) || 1,
+          ramTotalBytes: Number(parts[6]) || 0,
+          uptimeSeconds: Number(parts[7]) || 0,
+        });
+      } else {
+        await recordAgentHeartbeat({
+          agentId: provisioned.agentId,
+          version: '0.2.0',
+          hostname: server.hostname,
+        });
+      }
+
+      const updatedView = await getOrProvisionServerAgent(server.id);
+      return res.status(200).json(updatedView);
+    } catch (error: any) {
+      console.error('POST /api/servers/:id/agent/install-ssh failed:', error);
+      return res.status(500).json({
+        error: error?.message || 'Failed to install agent via SSH',
+      });
     }
   });
 
@@ -1593,18 +1803,15 @@ export function createApp() {
     }
   });
 
-  // --- Agent Binary & Systemd Unit Download Endpoints (for self-hosted Docker deployment) ---
+  // --- Agent Binary & Systemd Unit Download Endpoints (for self-hosted Docker deployment & preview) ---
   app.get('/downloads/infralab-agent', (_req, res) => {
     const binPath = path.join(process.cwd(), 'bin', 'infralab-agent');
-    if (!fs.existsSync(binPath)) {
-      return res.status(404).json({
-        error:
-          'Agent binary not built in this container. Build with Docker Compose or run: cd agent && go build -o ../bin/infralab-agent ./cmd/infralab-agent',
-      });
-    }
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', 'attachment; filename="infralab-agent"');
-    return res.sendFile(binPath);
+    if (fs.existsSync(binPath)) {
+      return res.sendFile(binPath);
+    }
+    return res.status(200).send(PORTABLE_AGENT_SCRIPT);
   });
 
   app.get('/downloads/infralab-agent.service', (_req, res) => {

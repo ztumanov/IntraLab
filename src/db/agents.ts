@@ -188,7 +188,7 @@ export async function enrollAgentWithToken(params: {
     .update(agents)
     .set({
       agentId: newAgentId,
-      version: (params.version || '0.1.0').trim(),
+      version: (params.version || '0.2.0').trim(),
       hostname: (params.hostname || '').trim(),
       // One-time token is invalidated immediately upon enrollment
       enrollmentTokenHash: '',
@@ -213,6 +213,60 @@ export async function enrollAgentWithToken(params: {
     agentId: newAgentId,
     credential: plainCredential,
     serverId: row.serverId,
+  };
+}
+
+export async function provisionAgentDirectlyForServer(params: {
+  serverId: number;
+  hostname: string;
+  version?: string;
+}): Promise<{
+  agentId: string;
+  credential: string;
+}> {
+  const newAgentId = generateAgentId();
+  const plainCredential = generateAgentCredential();
+  const credHash = sha256Hex(plainCredential);
+  const now = new Date();
+  const version = (params.version || '0.2.0').trim();
+  const hostname = (params.hostname || '').trim();
+
+  const existing = await db
+    .select()
+    .from(agents)
+    .where(eq(agents.serverId, params.serverId));
+
+  if (existing.length === 0) {
+    await db.insert(agents).values({
+      serverId: params.serverId,
+      agentId: newAgentId,
+      version,
+      hostname,
+      enrollmentTokenHash: '',
+      enrollmentTokenEncrypted: '',
+      credentialHash: credHash,
+      lastSeenAt: now,
+      updatedAt: now,
+    });
+  } else {
+    await db
+      .update(agents)
+      .set({
+        agentId: newAgentId,
+        version,
+        hostname,
+        enrollmentTokenHash: '',
+        enrollmentTokenEncrypted: '',
+        credentialHash: credHash,
+        lastSeenAt: now,
+        updatedAt: now,
+      })
+      .where(eq(agents.serverId, params.serverId));
+  }
+
+  return {
+    agentId: newAgentId,
+    credential: plainCredential,
   };
 }
 

@@ -377,6 +377,25 @@ export async function rotateServerAgentToken(id: number): Promise<ServerAgentInf
   return response.json();
 }
 
+export async function installServerAgentViaSsh(id: number): Promise<ServerAgentInfo> {
+  const headers = await getAuthHeaders();
+  const serverUrl = typeof window !== 'undefined' ? window.location.origin : '';
+  const response = await fetch(`/api/servers/${id}/agent/install-ssh`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ server_url: serverUrl }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new ApiRequestError(
+      body.error || 'Failed to install agent over SSH',
+      response.status,
+      body.details
+    );
+  }
+  return response.json();
+}
+
 export async function fetchServerMonitoring(
   id: number,
   range: MonitoringTimeRange = '1h'
