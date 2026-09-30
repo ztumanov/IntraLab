@@ -175,6 +175,8 @@ func runDaemonCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	metricsSrv := &http.Server{
 		Handler:           exporter.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
 	}
 	go func() {
 		logger.Printf("serving Prometheus /metrics on http://%s/metrics", ln.Addr().String())

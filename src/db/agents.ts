@@ -44,12 +44,13 @@ export function generateAgentCredential(): string {
 
 export function computeAgentStatus(
   agentId: string,
-  lastSeenAt: Date | null
+  lastSeenAt: Date | null,
+  version?: string | null
 ): AgentStatusState {
   if (!agentId || agentId.trim() === '') {
     return 'NOT INSTALLED';
   }
-  if (!lastSeenAt) {
+  if (version === 'stopped' || !lastSeenAt) {
     return 'OFFLINE';
   }
   const ageMs = Date.now() - lastSeenAt.getTime();
@@ -93,7 +94,7 @@ export async function getOrProvisionServerAgent(serverId: number): Promise<Serve
     row = updated[0];
   }
 
-  const status = computeAgentStatus(row.agentId, row.lastSeenAt);
+  const status = computeAgentStatus(row.agentId, row.lastSeenAt, row.version);
   const view: ServerAgentView = {
     server_id: row.serverId,
     status,
@@ -326,6 +327,14 @@ export async function recordAgentHeartbeat(params: {
   hostname?: string;
 }): Promise<Date> {
   const now = new Date();
+  const currentRows = await db
+    .select()
+    .from(agents)
+    .where(eq(agents.agentId, params.agentId));
+  if (currentRows[0]?.version === 'stopped') {
+    return now;
+  }
+
   const updateSet: Record<string, any> = {
     lastSeenAt: now,
     updatedAt: now,
@@ -382,6 +391,14 @@ export async function recordAgentSystemInfo(params: {
   uptimeSeconds: number;
 }): Promise<Date> {
   const now = new Date();
+  const currentRows = await db
+    .select()
+    .from(agents)
+    .where(eq(agents.agentId, params.agentId));
+  if (currentRows[0]?.version === 'stopped') {
+    return now;
+  }
+
   const safeCpu = Math.max(1, Math.round(Number(params.cpuCount) || 1));
   const safeRamBytes = Math.max(0, Math.round(Number(params.ramTotalBytes) || 0));
   const safeUptime = Math.max(0, Math.round(Number(params.uptimeSeconds) || 0));
@@ -462,6 +479,7 @@ export async function listPrometheusAgentTargets(
     .select({
       serverId: agents.serverId,
       agentId: agents.agentId,
+      version: agents.version,
       agentHostname: agents.hostname,
       serverHostname: servers.hostname,
       serverName: servers.name,
@@ -472,7 +490,7 @@ export async function listPrometheusAgentTargets(
 
   const targets: PrometheusTargetGroup[] = [];
   for (const row of rows) {
-    if (!row.agentId || !row.agentId.trim()) {
+    if (!row.agentId || !row.agentId.trim() || row.version === 'stopped') {
       continue;
     }
     const host = (row.ipAddress || row.serverHostname || '').trim();

@@ -1295,6 +1295,7 @@ function executeRealSshCommand(opts: {
             return;
           }
 
+          const MAX_SSH_OUTPUT_CHARS = 4 * 1024 * 1024;
           let stdout = '';
           let stderr = '';
           stream
@@ -1312,10 +1313,14 @@ function executeRealSshCommand(opts: {
               }
             })
             .on('data', (data: Buffer) => {
-              stdout += data.toString('utf8');
+              if (stdout.length < MAX_SSH_OUTPUT_CHARS) {
+                stdout += data.toString('utf8').slice(0, MAX_SSH_OUTPUT_CHARS - stdout.length);
+              }
             })
             .stderr.on('data', (data: Buffer) => {
-              stderr += data.toString('utf8');
+              if (stderr.length < MAX_SSH_OUTPUT_CHARS) {
+                stderr += data.toString('utf8').slice(0, MAX_SSH_OUTPUT_CHARS - stderr.length);
+              }
             });
         });
       })

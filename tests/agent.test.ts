@@ -12,8 +12,10 @@ import {
   recordAgentHeartbeat,
   recordAgentSystemInfo,
   rotateServerEnrollmentToken,
+  stopServerAgent,
   verifyAgentCredential,
 } from '../src/db/agents.ts';
+import { formatStructuredLog, sanitizeLogFields } from '../src/lib/logger.ts';
 import {
   buildPromQLQueriesForServer,
   fetchServerMonitoringMetrics,
@@ -29,7 +31,7 @@ test('Linux Agent lifecycle, Prometheus HTTP Service Discovery, and PromQL range
     .values({
       uid: testUserUid,
       email: 'agent-test@infralab.local',
-      displayName: 'Agent Test Runner',
+      username: 'agent-test-runner',
     })
     .onConflictDoNothing();
 
@@ -206,6 +208,32 @@ test('Linux Agent lifecycle, Prometheus HTTP Service Discovery, and PromQL range
       assert.ok(receivedQueries.includes(expectedQueries.cpu));
       assert.ok(receivedQueries.includes(expectedQueries.memory));
       assert.ok(receivedQueries.includes(expectedQueries.disk));
+
+      // 10. Regression test for BUG-001: stopping an agent marks it OFFLINE, excludes it from Prometheus SD,
+      // and prevents stray heartbeats from reviving it back to ONLINE.
+      const stoppedView = await stopServerAgent(server.id);
+      assert.equal(stoppedView.status, 'OFFLINE');
+      assert.equal(stoppedView.version, 'stopped');
+      assert.equal(stoppedView.last_seen_at, null);
+
+      const targetsAfterStop = await listPrometheusAgentTargets(9101);
+      const stoppedInTargets = targetsAfterStop.find(
+        (t) => t.labels.server_id === String(server.id)
+      );
+      assert.equal(
+        stoppedInTargets,
+        undefined,
+        'Stopped agent must be excluded from Prometheus HTTP SD target list'
+      );
+
+      // Late heartbeat after stop must not revive the stopped agent
+      await recordAgentHeartbeat({
+        agentId: enrollResult.agentId,
+        hostname: 'prod-linux-01',
+      });
+      const afterLateHeartbeat = await getOrProvisionServerAgent(server.id);
+      assert.equal(afterLateHeartbeat.status, 'OFFLINE');
+      assert.equal(afterLateHeartbeat.version, 'stopped');
     } finally {
       await new Promise<void>((resolve) => mockPromServer.close(() => resolve()));
     }
@@ -213,4 +241,37 @@ test('Linux Agent lifecycle, Prometheus HTTP Service Discovery, and PromQL range
     await deleteServerById(server.id, testUserUid);
     await db.delete(users).where(eq(users.uid, testUserUid));
   }
+});
+
+test('Structured logger redacts passwords, tokens, private keys, and authorization headers', () => {
+  const sanitized = sanitizeLogFields({
+    component: 'agent',
+    operation: 'enroll',
+    server_id: 42,
+    password: 'super-secret-password',
+    enrollment_token: 'ila_enroll_abcdef1234567890',
+    authorization: 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret',
+    error: new Error(
+      'Failed with token ila_enroll_999999 and Bearer secret_jwt_token'
+    ),
+  });
+
+  assert.equal(sanitized.password, '[REDACTED]');
+  assert.equal(sanitized.enrollment_token, '[REDACTED]');
+  assert.equal(sanitized.authorization, '[REDACTED]');
+  assert.ok(!String(sanitized.error).includes('ila_enroll_999999'));
+  assert.ok(!String(sanitized.error).includes('secret_jwt_token'));
+
+  const line = formatStructuredLog('error', {
+    component: 'ssh',
+    operation: 'connect',
+    server_id: 7,
+    encryptedSecret: 'aes-cipher',
+    error: 'Connection refused',
+  });
+  assert.ok(line.includes('component=ssh'));
+  assert.ok(line.includes('operation=connect'));
+  assert.ok(line.includes('server_id=7'));
+  assert.ok(line.includes('encryptedSecret=[REDACTED]'));
+  assert.ok(!line.includes('aes-cipher'));
 });

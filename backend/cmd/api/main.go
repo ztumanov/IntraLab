@@ -11,6 +11,7 @@ import (
 
 	"github.com/infralab/infralab/backend/internal/config"
 	"github.com/infralab/infralab/backend/internal/database"
+	"github.com/infralab/infralab/backend/internal/health"
 	infrahttp "github.com/infralab/infralab/backend/internal/http"
 	"github.com/infralab/infralab/backend/internal/servers"
 )
@@ -33,14 +34,19 @@ func main() {
 	repo := servers.NewPostgresRepository(db)
 	svc := servers.NewService(repo)
 	serverHandler := servers.NewHandler(svc)
-	router := infrahttp.NewRouter(serverHandler)
+	router := infrahttp.NewRouterWithReadiness(serverHandler, &health.ReadinessChecker{
+		CheckDatabase: func(checkCtx context.Context) error {
+			return db.PingContext(checkCtx)
+		},
+	})
 
 	srv := &http.Server{
-		Addr:         ":" + cfg.APIPort,
-		Handler:      router,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + cfg.APIPort,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

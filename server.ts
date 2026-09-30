@@ -4,7 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
+import { pool } from './src/db/index.ts';
 import { ensureDatabaseSchema } from './src/db/bootstrap.ts';
+import { logger } from './src/lib/logger.ts';
 import { attachTerminalWebSocketServer } from './src/server/wsTerminal.ts';
 import {
   listServersByUser,
@@ -375,6 +377,69 @@ export function createApp() {
       status: 'ok',
       service: 'infralab-api',
       timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.get('/api/ready', async (req, res) => {
+    const checks: {
+      database: 'ok' | 'error';
+      prometheus: 'ok' | 'error';
+    } = {
+      database: 'ok',
+      prometheus: 'ok',
+    };
+
+    try {
+      await pool.query('SELECT 1');
+    } catch (err: any) {
+      checks.database = 'error';
+      logger.error({
+        component: 'health',
+        operation: 'ready_check_database',
+        error: err?.message || 'PostgreSQL readiness check failed',
+      });
+    }
+
+    const configuredPromUrl = (process.env.PROMETHEUS_URL || '').trim();
+    const strictProm = req.query.strict_prometheus === 'true' || Boolean(configuredPromUrl);
+
+    if (strictProm) {
+      const targetUrl = `${(configuredPromUrl || 'http://localhost:9090').replace(/\/+$/, '')}/-/ready`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000);
+      try {
+        const resp = await fetch(targetUrl, { signal: controller.signal });
+        if (!resp.ok) {
+          checks.prometheus = 'error';
+        }
+      } catch (err: any) {
+        checks.prometheus = 'error';
+        logger.warn({
+          component: 'health',
+          operation: 'ready_check_prometheus',
+          error: err?.message || 'Prometheus readiness check failed',
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    } else {
+      try {
+        await listPrometheusAgentTargets(9101);
+        checks.prometheus = 'ok';
+      } catch (err: any) {
+        checks.prometheus = 'error';
+        logger.error({
+          component: 'health',
+          operation: 'ready_check_prometheus_targets',
+          error: err?.message || 'Prometheus target discovery failed',
+        });
+      }
+    }
+
+    const isReady = checks.database === 'ok' && checks.prometheus === 'ok';
+    return res.status(isReady ? 200 : 503).json({
+      status: isReady ? 'ok' : 'error',
+      checks,
     });
   });
 
@@ -1439,13 +1504,25 @@ export function createApp() {
       }
 
       // Return permanent credential once during enrollment; never log it
+      logger.info({
+        component: 'agent',
+        operation: 'enroll',
+        server_id: enrolled.serverId,
+        agent_id: enrolled.agentId,
+        hostname,
+        version,
+      });
       return res.status(200).json({
         agent_id: enrolled.agentId,
         credential: enrolled.credential,
         server_id: enrolled.serverId,
       });
     } catch (error: any) {
-      console.error('POST /api/agents/enroll failed:', error?.message || 'Internal error');
+      logger.error({
+        component: 'agent',
+        operation: 'enroll',
+        error: error?.message || 'Internal error',
+      });
       return res.status(500).json({ error: 'Failed to enroll agent' });
     }
   });
@@ -1479,7 +1556,11 @@ export function createApp() {
         last_seen_at: seenAt.toISOString(),
       });
     } catch (error: any) {
-      console.error('POST /api/agents/heartbeat failed:', error?.message || 'Internal error');
+      logger.error({
+        component: 'agent',
+        operation: 'heartbeat',
+        error: error?.message || 'Internal error',
+      });
       return res.status(500).json({ error: 'Failed to process agent heartbeat' });
     }
   });
@@ -1546,7 +1627,10 @@ export function createApp() {
         ? Date.now() - new Date(agentView.last_seen_at).getTime()
         : Infinity;
 
+      const isPassiveQuery = req.query.passive === 'true';
+
       if (
+        !isPassiveQuery &&
         agentView.agent_id &&
         agentView.version !== 'stopped' &&
         lastSeenAgeMs > 25000 &&

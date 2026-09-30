@@ -81,6 +81,14 @@ func TestAPIEndpoints(t *testing.T) {
 		t.Fatalf("expected 200 OK from /api/health, got %d", rec.Code)
 	}
 
+	// 1b. Readiness endpoint
+	req = httptest.NewRequest(http.MethodGet, "/api/ready", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/ready, got %d", rec.Code)
+	}
+
 	// 2. Create server (POST /api/servers)
 	body := []byte(`{"name":"web-01","hostname":"web-01","ip_address":"10.10.10.11","ssh_port":22,"username":"admin","description":"Web server"}`)
 	req = httptest.NewRequest(http.MethodPost, "/api/servers", bytes.NewReader(body))

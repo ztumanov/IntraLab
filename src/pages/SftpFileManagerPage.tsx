@@ -1016,7 +1016,7 @@ export const SftpFileManagerPage: React.FC = () => {
                       await mkdirMutation.mutateAsync({
                         serverId: activeServer.id,
                         path: resolvedPath,
-                        sudo: useSudo,
+                        useSudo,
                       });
                       setStatusMessage({
                         type: 'success',
