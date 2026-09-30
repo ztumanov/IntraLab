@@ -22,14 +22,14 @@ import {
 import { MonitoringTimeRange, PrometheusMetricPoint } from '../types/server.ts';
 import { useI18n } from '../context/I18nContext.tsx';
 
-const TIME_RANGES: { key: MonitoringTimeRange; labelRu: string; labelEn: string }[] = [
+export const TIME_RANGES: { key: MonitoringTimeRange; labelRu: string; labelEn: string }[] = [
   { key: '1h', labelRu: '1ч (1h)', labelEn: '1h' },
   { key: '6h', labelRu: '6ч (6h)', labelEn: '6h' },
   { key: '24h', labelRu: '24ч (24h)', labelEn: '24h' },
   { key: '7d', labelRu: '7д (7d)', labelEn: '7d' },
 ];
 
-function formatUptimeDuration(seconds: number): string {
+export function formatUptimeDuration(seconds: number): string {
   const sec = Math.max(0, Math.floor(seconds || 0));
   const days = Math.floor(sec / 86400);
   const hours = Math.floor((sec % 86400) / 3600);
@@ -102,7 +102,7 @@ interface SingleMetricChartProps {
   formatDetail?: (pt: PrometheusMetricPoint) => string;
 }
 
-const SinglePromChartCard: React.FC<SingleMetricChartProps> = ({
+export const SinglePromChartCard: React.FC<SingleMetricChartProps> = ({
   title,
   subtitle,
   promql,
@@ -315,7 +315,7 @@ interface NetworkRxTxChartProps {
   promqlTx: string;
 }
 
-const NetworkRxTxChartCard: React.FC<NetworkRxTxChartProps> = ({
+export const NetworkRxTxChartCard: React.FC<NetworkRxTxChartProps> = ({
   series,
   range,
   promqlRx,

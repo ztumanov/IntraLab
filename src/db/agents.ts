@@ -121,6 +121,26 @@ export async function getOrProvisionServerAgent(serverId: number): Promise<Serve
   return view;
 }
 
+export async function stopServerAgent(serverId: number): Promise<ServerAgentView> {
+  const existingRows = await db
+    .select()
+    .from(agents)
+    .where(eq(agents.serverId, serverId));
+
+  if (existingRows.length > 0) {
+    await db
+      .update(agents)
+      .set({
+        version: 'stopped',
+        lastSeenAt: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(agents.serverId, serverId));
+  }
+
+  return getOrProvisionServerAgent(serverId);
+}
+
 export async function rotateServerEnrollmentToken(serverId: number): Promise<ServerAgentView> {
   const token = generateEnrollmentToken();
   const existingRows = await db

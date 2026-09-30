@@ -19,6 +19,7 @@ import {
   installServerAgentViaSsh,
   launchDockerContainer,
   rotateServerAgentToken,
+  stopServerAgentViaSsh,
   triggerDockerContainerAction,
   updateServerCredentials,
 } from '../api/servers.ts';
@@ -66,14 +67,14 @@ export function useServerAgent(id: number) {
     queryKey: ['servers', id, 'agent'],
     queryFn: () => fetchServerAgent(id),
     enabled: Number.isInteger(id) && id > 0,
-    refetchInterval: 10000,
+    refetchInterval: false,
   });
 }
 
 export function useServerMonitoring(
   id: number,
   range: MonitoringTimeRange,
-  autoRefreshMs: number | false = 15000
+  autoRefreshMs: number | false = false
 ) {
   return useQuery({
     queryKey: ['servers', id, 'monitoring', range],
@@ -101,6 +102,17 @@ export function useInstallServerAgentViaSsh() {
       queryClient.setQueryData(['servers', id, 'agent'], updated);
       queryClient.invalidateQueries({ queryKey: ['servers', id] });
       queryClient.invalidateQueries({ queryKey: ['servers'] });
+      queryClient.invalidateQueries({ queryKey: ['servers', id, 'monitoring'] });
+    },
+  });
+}
+
+export function useStopServerAgentViaSsh() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => stopServerAgentViaSsh(id),
+    onSuccess: (updated, id) => {
+      queryClient.setQueryData(['servers', id, 'agent'], updated);
       queryClient.invalidateQueries({ queryKey: ['servers', id, 'monitoring'] });
     },
   });

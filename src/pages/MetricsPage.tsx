@@ -4,6 +4,8 @@ import {
   Activity,
   AlertCircle,
   ArrowUpRight,
+  CheckCircle2,
+  Clock,
   Cpu,
   HardDrive,
   KeyRound,
@@ -12,17 +14,31 @@ import {
   Plus,
   RefreshCw,
   Server as ServerIcon,
+  Square,
+  Terminal,
+  Zap,
 } from 'lucide-react';
 import {
   useCheckAllServers,
   useCheckServerConnection,
+  useInstallServerAgentViaSsh,
+  useServerAgent,
+  useServerMonitoring,
   useServers,
   useServerTelemetry,
+  useStopServerAgentViaSsh,
 } from '../hooks/useServers.ts';
 import {
   FleetResourceOverviewChart,
   ServerResourceCharts,
 } from '../components/ResourceCharts.tsx';
+import {
+  formatUptimeDuration,
+  NetworkRxTxChartCard,
+  SinglePromChartCard,
+  TIME_RANGES,
+} from './ServerMonitoringPage.tsx';
+import { MonitoringTimeRange } from '../types/server.ts';
 import { useI18n } from '../context/I18nContext.tsx';
 
 interface LayoutOutletContext {
@@ -37,10 +53,14 @@ export const MetricsPage: React.FC = () => {
   const { data: servers = [], isLoading: isLoadingServers } = useServers();
   const checkAllMutation = useCheckAllServers();
   const checkOneMutation = useCheckServerConnection();
+  const installAgentMutation = useInstallServerAgentViaSsh();
+  const stopAgentMutation = useStopServerAgentViaSsh();
 
   const paramServerId = Number(searchParams.get('serverId'));
   const [selectedServerId, setSelectedServerId] = useState<number>(0);
   const [autoPoll, setAutoPoll] = useState<boolean>(false);
+  const [promRange, setPromRange] = useState<MonitoringTimeRange>('1h');
+  const [showPromQueries, setShowPromQueries] = useState<boolean>(false);
   const [activeSubTab, setActiveSubTab] = useState<'processes' | 'disks' | 'network'>(
     'processes'
   );
@@ -72,11 +92,25 @@ export const MetricsPage: React.FC = () => {
     refetch: refetchTelemetry,
   } = useServerTelemetry(selectedServer?.id || 0, autoPoll ? 10000 : false);
 
+  const { data: agentInfo, refetch: refetchAgent } = useServerAgent(
+    selectedServer?.id || 0
+  );
+
+  const {
+    data: monitoring,
+    isFetching: isFetchingMonitoring,
+    refetch: refetchMonitoring,
+  } = useServerMonitoring(
+    selectedServer?.id || 0,
+    promRange,
+    autoPoll ? 10000 : false
+  );
+
   const handlePollSelected = async () => {
     if (!selectedServer) return;
     try {
       await checkOneMutation.mutateAsync(selectedServer.id);
-      await refetchTelemetry();
+      await Promise.all([refetchTelemetry(), refetchMonitoring(), refetchAgent()]);
     } catch (err) {
       console.error('Failed to poll server telemetry:', err);
     }
@@ -86,10 +120,31 @@ export const MetricsPage: React.FC = () => {
     try {
       await checkAllMutation.mutateAsync();
       if (selectedServer) {
-        await refetchTelemetry();
+        await Promise.all([refetchTelemetry(), refetchMonitoring(), refetchAgent()]);
       }
     } catch (err) {
       console.error('Failed to poll fleet telemetry:', err);
+    }
+  };
+
+  const handleInstallAgentOnSelected = async () => {
+    if (!selectedServer) return;
+    try {
+      await installAgentMutation.mutateAsync(selectedServer.id);
+      await Promise.all([refetchAgent(), refetchMonitoring()]);
+    } catch (err) {
+      console.error('Failed to install agent via SSH:', err);
+    }
+  };
+
+  const handleStopAgentOnSelected = async () => {
+    if (!selectedServer) return;
+    try {
+      setAutoPoll(false);
+      await stopAgentMutation.mutateAsync(selectedServer.id);
+      await Promise.all([refetchAgent(), refetchMonitoring()]);
+    } catch (err) {
+      console.error('Failed to stop agent via SSH:', err);
     }
   };
 
@@ -111,8 +166,8 @@ export const MetricsPage: React.FC = () => {
           </h1>
           <p className="mt-1 text-sm text-slate-400">
             {t(
-              'Мониторинг CPU, RAM, Disk, Network и задержки SSH в реальном времени.',
-              'Real-time CPU, RAM, Disk, Network, and SSH latency time-series observability.'
+              'Мониторинг CPU, RAM, Disk, Network, Prometheus и задержки SSH в реальном времени.',
+              'Real-time CPU, RAM, Disk, Network, Prometheus, and SSH latency time-series observability.'
             )}
           </p>
         </div>
@@ -124,8 +179,8 @@ export const MetricsPage: React.FC = () => {
           </h2>
           <p className="mt-1 text-xs text-slate-400 max-w-md mx-auto">
             {t(
-              'Добавьте Linux-сервер с паролем или приватным SSH-ключом, чтобы собирать живую телеметрию ресурсов и строить графики нагрузки.',
-              'Add a Linux server with SSH credentials to collect live resource telemetry and plot time-series utilization charts.'
+              'Добавьте Linux-сервер с паролем или приватным SSH-ключом, чтобы собирать живую телеметрию ресурсов и строить графики нагрузки Prometheus.',
+              'Add a Linux server with SSH credentials to collect live resource telemetry and plot Prometheus time-series utilization charts.'
             )}
           </p>
           <button
@@ -142,17 +197,38 @@ export const MetricsPage: React.FC = () => {
   }
 
   const activeServer = liveTelemetry?.server || selectedServer!;
+  const isAgentStopped = agentInfo?.version === 'stopped';
+  const isPrometheusConnected = Boolean(
+    !isAgentStopped &&
+      (monitoring?.prometheus_connected ||
+        agentInfo?.status === 'ONLINE' ||
+        agentInfo?.agent_id)
+  );
+
   const cpuPct =
-    activeServer.cpu_usage_percent ?? (activeServer.status === 'online' ? 14 : 0);
+    (isPrometheusConnected && monitoring?.summary?.current_cpu_percent !== undefined
+      ? Math.round(monitoring.summary.current_cpu_percent)
+      : activeServer.cpu_usage_percent) ??
+    (activeServer.status === 'online' ? 14 : 0);
+
   const memTotal = activeServer.memory_mb ?? 4096;
   const memUsed =
     activeServer.memory_used_mb ??
     (activeServer.status === 'online' ? Math.round(memTotal * 0.34) : 0);
   const memPct =
-    memTotal > 0 ? Math.min(100, Math.round((memUsed / memTotal) * 100)) : 0;
-  const diskPct =
-    activeServer.disk_usage_percent ?? (activeServer.status === 'online' ? 28 : 0);
+    isPrometheusConnected && monitoring?.summary?.current_memory_percent !== undefined
+      ? Math.round(monitoring.summary.current_memory_percent)
+      : memTotal > 0
+        ? Math.min(100, Math.round((memUsed / memTotal) * 100))
+        : 0;
 
+  const diskPct =
+    (isPrometheusConnected && monitoring?.summary?.current_disk_percent !== undefined
+      ? Math.round(monitoring.summary.current_disk_percent)
+      : activeServer.disk_usage_percent) ??
+    (activeServer.status === 'online' ? 28 : 0);
+
+  const totalDiskGb = activeServer.disk_total_gb || '40';
   const filesystems = liveTelemetry?.filesystems || [];
   const topProcesses = liveTelemetry?.top_processes || [];
   const networkInterfaces = liveTelemetry?.network_interfaces || [];
@@ -163,12 +239,12 @@ export const MetricsPage: React.FC = () => {
       <div className="flex flex-col gap-4 border-b border-slate-800 pb-5 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-slate-100">
-            {t('Метрики и телеметрия хостов (Metrics)', 'Metrics & Host Telemetry')}
+            {t('Метрики и телеметрия хостов (Metrics & Prometheus)', 'Metrics & Prometheus Telemetry')}
           </h1>
           <p className="mt-1 text-sm text-slate-400">
             {t(
-              'Живые графики загрузки CPU, RAM, дисковых разделов, сетевых интерфейсов и процессов по SSH.',
-              'Real-time CPU, RAM, disk partitions, network interfaces, and process telemetry over SSH.'
+              'Живые графики Prometheus (PromQL), загрузка CPU, RAM, дисковых разделов, сетевого трафика RX/TX и процессов ОС.',
+              'Real-time Prometheus (PromQL) time-series charts, CPU, RAM, disk partitions, RX/TX throughput, and OS processes.'
             )}
           </p>
         </div>
@@ -198,17 +274,19 @@ export const MetricsPage: React.FC = () => {
           <button
             type="button"
             onClick={handlePollSelected}
-            disabled={checkOneMutation.isPending || isFetchingTelemetry}
+            disabled={checkOneMutation.isPending || isFetchingTelemetry || isFetchingMonitoring}
             className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-60 whitespace-nowrap"
           >
             <RefreshCw
               className={`h-3.5 w-3.5 ${
-                checkOneMutation.isPending || isFetchingTelemetry ? 'animate-spin' : ''
+                checkOneMutation.isPending || isFetchingTelemetry || isFetchingMonitoring
+                  ? 'animate-spin'
+                  : ''
               }`}
             />
             <span>
-              {checkOneMutation.isPending || isFetchingTelemetry
-                ? t('Сбор метрик...', 'Polling SSH...')
+              {checkOneMutation.isPending || isFetchingTelemetry || isFetchingMonitoring
+                ? t('Сбор метрик...', 'Polling Metrics...')
                 : t('Обновить метрики узла', 'Refresh Node Telemetry')}
             </span>
           </button>
@@ -265,20 +343,34 @@ export const MetricsPage: React.FC = () => {
                   <span className="font-mono text-[11px] text-slate-400 tabular-nums">
                     ({srv.ip_address})
                   </span>
+                  {isSelected && isPrometheusConnected && (
+                    <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-300 border border-emerald-500/30">
+                      PROMETHEUS
+                    </span>
+                  )}
                 </button>
               );
             })}
           </div>
 
-          <Link
-            to={`/servers/${activeServer.id}`}
-            className="inline-flex items-center gap-1 font-mono text-xs text-emerald-400 hover:underline whitespace-nowrap self-start sm:self-auto"
-          >
-            <span>
-              {t('Карточка и SSH-консоль сервера', 'Server Card & SSH Console')}
-            </span>
-            <ArrowUpRight className="h-3.5 w-3.5" />
-          </Link>
+          <div className="flex flex-wrap items-center gap-3 self-start sm:self-auto">
+            <Link
+              to={`/servers/${activeServer.id}/monitoring`}
+              className="inline-flex items-center gap-1 font-mono text-xs text-sky-400 hover:underline whitespace-nowrap"
+            >
+              <span>{t('Полный экран Prometheus', 'Full Prometheus View')}</span>
+              <ArrowUpRight className="h-3.5 w-3.5" />
+            </Link>
+            <Link
+              to={`/servers/${activeServer.id}`}
+              className="inline-flex items-center gap-1 font-mono text-xs text-emerald-400 hover:underline whitespace-nowrap"
+            >
+              <span>
+                {t('Карточка и SSH-консоль сервера', 'Server Card & SSH Console')}
+              </span>
+              <ArrowUpRight className="h-3.5 w-3.5" />
+            </Link>
+          </div>
         </div>
 
         {/* Warning if selected server has no SSH secret */}
@@ -316,7 +408,7 @@ export const MetricsPage: React.FC = () => {
               </h2>
             </div>
             <span className="font-mono text-base font-semibold text-slate-100 tabular-nums">
-              {activeServer.status === 'online' ? `${cpuPct}%` : '—'}
+              {activeServer.status === 'online' || isPrometheusConnected ? `${cpuPct}%` : '—'}
             </span>
           </div>
 
@@ -329,13 +421,26 @@ export const MetricsPage: React.FC = () => {
                     ? 'bg-amber-500'
                     : 'bg-emerald-500'
               }`}
-              style={{ width: `${activeServer.status === 'online' ? cpuPct : 0}%` }}
+              style={{
+                width: `${
+                  activeServer.status === 'online' || isPrometheusConnected ? cpuPct : 0
+                }%`,
+              }}
             />
           </div>
 
           <div className="mt-4 flex items-center justify-between text-xs text-slate-400 font-mono tabular-nums">
-            <span>Cores: {activeServer.cpu_cores ?? 4} vCPU</span>
-            <span>Load: {activeServer.cpu_load || '0.24 0.18 0.12'}</span>
+            <span>
+              Cores: {activeServer.cpu_cores || agentInfo?.cpu_count || 4} vCPU
+            </span>
+            <span>
+              Load:{' '}
+              {monitoring?.summary?.load1 !== undefined
+                ? `${monitoring.summary.load1} ${monitoring.summary.load5 ?? ''} ${
+                    monitoring.summary.load15 ?? ''
+                  }`
+                : activeServer.cpu_load || '0.24 0.18 0.12'}
+            </span>
           </div>
         </section>
 
@@ -349,7 +454,7 @@ export const MetricsPage: React.FC = () => {
               </h2>
             </div>
             <span className="font-mono text-base font-semibold text-slate-100 tabular-nums">
-              {activeServer.status === 'online' ? `${memPct}%` : '—'}
+              {activeServer.status === 'online' || isPrometheusConnected ? `${memPct}%` : '—'}
             </span>
           </div>
 
@@ -362,13 +467,20 @@ export const MetricsPage: React.FC = () => {
                     ? 'bg-amber-500'
                     : 'bg-sky-500'
               }`}
-              style={{ width: `${activeServer.status === 'online' ? memPct : 0}%` }}
+              style={{
+                width: `${
+                  activeServer.status === 'online' || isPrometheusConnected ? memPct : 0
+                }%`,
+              }}
             />
           </div>
 
           <div className="mt-4 flex items-center justify-between text-xs text-slate-400 font-mono tabular-nums">
             <span>
-              Used: {activeServer.status === 'online' ? `${memUsed} MB` : '—'}
+              Used:{' '}
+              {activeServer.status === 'online' || isPrometheusConnected
+                ? `${Math.round((memPct / 100) * memTotal)} MB`
+                : '—'}
             </span>
             <span>Total: {memTotal} MB</span>
           </div>
@@ -384,7 +496,7 @@ export const MetricsPage: React.FC = () => {
               </h2>
             </div>
             <span className="font-mono text-base font-semibold text-slate-100 tabular-nums">
-              {activeServer.status === 'online' ? `${diskPct}%` : '—'}
+              {activeServer.status === 'online' || isPrometheusConnected ? `${diskPct}%` : '—'}
             </span>
           </div>
 
@@ -397,7 +509,11 @@ export const MetricsPage: React.FC = () => {
                     ? 'bg-amber-500'
                     : 'bg-indigo-500'
               }`}
-              style={{ width: `${activeServer.status === 'online' ? diskPct : 0}%` }}
+              style={{
+                width: `${
+                  activeServer.status === 'online' || isPrometheusConnected ? diskPct : 0
+                }%`,
+              }}
             />
           </div>
 
@@ -408,7 +524,319 @@ export const MetricsPage: React.FC = () => {
         </section>
       </div>
 
-      {/* Main Interactive Time-Series Resource Charts */}
+      {/* PROMETHEUS GRAPHS SECTION (Shown automatically when connected on the host, or with 1-click installer if not connected) */}
+      {isPrometheusConnected && monitoring ? (
+        <section className="rounded-lg border border-emerald-500/30 bg-[#1E293B] p-6 space-y-6">
+          {/* Prometheus Section Header & Time Range Controls */}
+          <div className="flex flex-col gap-4 border-b border-slate-800 pb-4 lg:flex-row lg:items-center lg:justify-between">
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <span className="inline-flex items-center gap-1.5 rounded bg-emerald-500/15 px-2.5 py-0.5 font-mono text-xs font-semibold text-emerald-300 border border-emerald-500/30">
+                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+                  PROMETHEUS CONNECTED
+                </span>
+                <h2 className="text-base font-semibold text-slate-100">
+                  {t(
+                    `Графики Prometheus и телеметрия агента — ${activeServer.name}`,
+                    `Prometheus Time-Series Graphs — ${activeServer.name}`
+                  )}
+                </h2>
+              </div>
+              <p className="font-mono text-xs text-slate-400">
+                Exporter:{' '}
+                <span className="text-emerald-400 font-semibold">
+                  {monitoring.exporter_type || 'infralab-agent (:9101/metrics)'}
+                </span>
+                {' · '}
+                Target: <span className="text-slate-200">http://{monitoring.scrape_target}</span>
+                {agentInfo?.agent_id && (
+                  <>
+                    {' · '}
+                    Agent ID: <span className="text-slate-300">{agentInfo.agent_id}</span>
+                  </>
+                )}
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5 self-start lg:self-auto">
+              {/* Time Range Selector: 1h | 6h | 24h | 7d */}
+              <div
+                role="group"
+                aria-label="Prometheus time range"
+                className="inline-flex items-center rounded-md border border-slate-800 bg-[#0F172A] p-1"
+              >
+                {TIME_RANGES.map((item) => {
+                  const active = promRange === item.key;
+                  return (
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={() => setPromRange(item.key)}
+                      className={`rounded px-2.5 py-1 font-mono text-xs font-semibold transition-colors ${
+                        active
+                          ? 'bg-emerald-600 text-white'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {item.key}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => refetchMonitoring()}
+                disabled={isFetchingMonitoring}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#0F172A] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-800 disabled:opacity-60"
+              >
+                <RefreshCw
+                  className={`h-3.5 w-3.5 text-emerald-400 ${
+                    isFetchingMonitoring ? 'animate-spin' : ''
+                  }`}
+                />
+                <span>{t('Обновить PromQL', 'Refresh PromQL')}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowPromQueries((prev) => !prev)}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#0F172A] px-3 py-1.5 font-mono text-xs font-medium text-slate-300 transition-colors hover:bg-slate-800"
+              >
+                <Terminal className="h-3.5 w-3.5 text-sky-400" />
+                <span>{showPromQueries ? t('Скрыть PromQL', 'Hide PromQL') : 'PromQL / Raw'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleStopAgentOnSelected}
+                disabled={stopAgentMutation.isPending}
+                className="inline-flex items-center gap-1.5 rounded-md border border-rose-500/40 bg-rose-950/30 px-3 py-1.5 text-xs font-semibold text-rose-300 transition-colors hover:bg-rose-950/60 disabled:opacity-60"
+              >
+                <Square className="h-3.5 w-3.5 fill-current" />
+                <span>
+                  {stopAgentMutation.isPending
+                    ? t('Остановка...', 'Stopping...')
+                    : t('Выключить агент', 'Stop Agent')}
+                </span>
+              </button>
+            </div>
+          </div>
+
+          {/* Prometheus Live Summary Strip */}
+          <div className="grid grid-cols-2 gap-3 rounded-lg border border-slate-800 bg-[#0F172A] p-3.5 sm:grid-cols-3 lg:grid-cols-6 font-mono text-xs tabular-nums">
+            <div>
+              <span className="text-slate-400 block text-[11px]">PromQL CPU</span>
+              <span className="text-emerald-400 font-semibold text-sm mt-0.5 block">
+                {monitoring.summary.current_cpu_percent}%
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[11px]">PromQL Memory</span>
+              <span className="text-sky-400 font-semibold text-sm mt-0.5 block">
+                {monitoring.summary.current_memory_percent}%
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[11px]">PromQL Disk (/)</span>
+              <span className="text-amber-400 font-semibold text-sm mt-0.5 block">
+                {monitoring.summary.current_disk_percent}%
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[11px]">Net RX / TX</span>
+              <span className="text-violet-300 font-semibold text-xs mt-0.5 block">
+                ↓{monitoring.summary.current_rx_kbps} · ↑{monitoring.summary.current_tx_kbps} KB/s
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[11px]">Load Avg (1/5/15m)</span>
+              <span className="text-slate-100 font-semibold text-xs mt-0.5 block">
+                {monitoring.summary.load1 ?? 0.22} / {monitoring.summary.load5 ?? 0.18} /{' '}
+                {monitoring.summary.load15 ?? 0.14}
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 flex items-center gap-1 text-[11px]">
+                <Clock className="h-3 w-3 text-emerald-400" />
+                Exporter Uptime
+              </span>
+              <span className="text-emerald-400 font-semibold text-sm mt-0.5 block">
+                {formatUptimeDuration(monitoring.summary.uptime_seconds)}
+              </span>
+            </div>
+          </div>
+
+          {/* 4 Interactive Prometheus Charts Grid */}
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+            <SinglePromChartCard
+              title={t('Prometheus: Загрузка CPU (CPU Usage)', 'Prometheus: CPU Usage')}
+              subtitle={t(
+                `Окно ${promRange} · Шаг ${monitoring.step_seconds}s · infralab-agent`,
+                `Window ${promRange} · Step ${monitoring.step_seconds}s · infralab-agent`
+              )}
+              promql={monitoring.promql_queries.cpu}
+              unit="%"
+              colorHex="#10B981"
+              gradientId="metricsPromCpuGrad"
+              series={monitoring.series}
+              range={promRange}
+              maxValue={100}
+              getValue={(pt) => pt.cpu_percent}
+            />
+
+            <SinglePromChartCard
+              title={t('Prometheus: Память RAM (Memory Usage)', 'Prometheus: Memory Usage')}
+              subtitle={t(
+                `Физическая память RAM (${memTotal} MB total)`,
+                `Physical RAM utilization (${memTotal} MB total)`
+              )}
+              promql={monitoring.promql_queries.memory}
+              unit="%"
+              colorHex="#38BDF8"
+              gradientId="metricsPromMemGrad"
+              series={monitoring.series}
+              range={promRange}
+              maxValue={100}
+              getValue={(pt) => pt.memory_percent}
+              formatDetail={(pt) => `${pt.memory_used_mb} / ${memTotal} MB`}
+            />
+
+            <SinglePromChartCard
+              title={t('Prometheus: Дисковый раздел / (Disk Usage)', 'Prometheus: Disk Usage')}
+              subtitle={t(
+                `Корневая ФС / (${totalDiskGb} GB total)`,
+                `Root filesystem / (${totalDiskGb} GB total)`
+              )}
+              promql={monitoring.promql_queries.disk}
+              unit="%"
+              colorHex="#F59E0B"
+              gradientId="metricsPromDiskGrad"
+              series={monitoring.series}
+              range={promRange}
+              maxValue={100}
+              getValue={(pt) => pt.disk_percent}
+              formatDetail={(pt) => `${pt.disk_used_gb} / ${totalDiskGb} GB`}
+            />
+
+            <NetworkRxTxChartCard
+              series={monitoring.series}
+              range={promRange}
+              promqlRx={monitoring.promql_queries.network_rx}
+              promqlTx={monitoring.promql_queries.network_tx}
+            />
+          </div>
+
+          {/* Optional PromQL & Raw Exporter Metrics Inspector */}
+          {showPromQueries && (
+            <div className="rounded-lg border border-slate-800 bg-[#0F172A] p-4 space-y-4 font-mono text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+                <span className="font-semibold text-slate-200">
+                  {t(
+                    'Активные PromQL-запросы и метрики экспортера на хосте (:9101/metrics)',
+                    'Active PromQL Queries & Live Host Exporter Metrics (:9101/metrics)'
+                  )}
+                </span>
+                <span className="text-emerald-400">
+                  http://{monitoring.scrape_target}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+                <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
+                  <span className="text-slate-400 block text-[11px]">CPU PromQL:</span>
+                  <code className="text-emerald-300 break-all">
+                    {monitoring.promql_queries.cpu}
+                  </code>
+                </div>
+                <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
+                  <span className="text-slate-400 block text-[11px]">Memory PromQL:</span>
+                  <code className="text-sky-300 break-all">
+                    {monitoring.promql_queries.memory}
+                  </code>
+                </div>
+                <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
+                  <span className="text-slate-400 block text-[11px]">Disk PromQL:</span>
+                  <code className="text-amber-300 break-all">
+                    {monitoring.promql_queries.disk}
+                  </code>
+                </div>
+                <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
+                  <span className="text-slate-400 block text-[11px]">Network RX/TX PromQL:</span>
+                  <code className="text-violet-300 break-all">
+                    {monitoring.promql_queries.network_rx}
+                  </code>
+                </div>
+              </div>
+
+              {monitoring.raw_metrics_preview && monitoring.raw_metrics_preview.length > 0 && (
+                <div>
+                  <span className="text-slate-400 block text-[11px] mb-1.5">
+                    {t(
+                      'Срез живого ответа экспортера (/metrics) с хоста:',
+                      'Live scraped /metrics exposition output from host:'
+                    )}
+                  </span>
+                  <pre className="max-h-48 overflow-y-auto rounded border border-slate-800 bg-[#0B1120] p-3 text-[11px] leading-relaxed text-emerald-300">
+                    {monitoring.raw_metrics_preview.join('\n')}
+                  </pre>
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      ) : (
+        <section className="rounded-lg border border-slate-800 bg-[#1E293B] p-5">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <Activity className="h-4 w-4 text-amber-400" />
+                <h2 className="text-sm font-semibold text-slate-100">
+                  {t(
+                    'Графики Prometheus (PromQL) не подключены на этом хосте',
+                    'Prometheus Exporter (:9101/metrics) is not connected on this host yet'
+                  )}
+                </h2>
+              </div>
+              <p className="text-xs text-slate-400 max-w-2xl">
+                {t(
+                  'Установите агент телеметрии infralab-agent на сервер в 1 клик по SSH, чтобы активировать экспортер Prometheus (:9101/metrics) и отобразить здесь графики CPU, RAM, Disk и Network RX/TX.',
+                  'Install the infralab-agent telemetry daemon via SSH in 1 click to enable the Prometheus exporter (:9101/metrics) and display PromQL charts here.'
+                )}
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5 self-start sm:self-auto">
+              {activeServer.has_secret && (
+                <button
+                  type="button"
+                  onClick={handleInstallAgentOnSelected}
+                  disabled={installAgentMutation.isPending}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-60 whitespace-nowrap"
+                >
+                  <Zap className="h-3.5 w-3.5" />
+                  <span>
+                    {installAgentMutation.isPending
+                      ? t('Установка агента по SSH...', 'Installing via SSH...')
+                      : t(
+                          'Подключить Prometheus-агент по SSH',
+                          'Connect Prometheus Agent via SSH'
+                        )}
+                  </span>
+                </button>
+              )}
+              <Link
+                to={`/servers/${activeServer.id}`}
+                className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-[#0F172A] px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 whitespace-nowrap"
+              >
+                <span>{t('Настройки агента →', 'Agent Settings →')}</span>
+              </Link>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Main Interactive Time-Series Resource Charts (SSH Snapshots & Latency) */}
       <ServerResourceCharts
         server={activeServer}
         metricsHistory={liveTelemetry?.metrics_history || []}
@@ -425,8 +853,12 @@ export const MetricsPage: React.FC = () => {
               )}
             </h2>
             <p className="text-xs text-slate-400 mt-0.5 font-mono">
-              {activeServer.os_info || 'Linux'} · {activeServer.kernel_info || '6.x'} ·{' '}
-              Uptime: {activeServer.uptime_info || '—'}
+              {activeServer.os_info || agentInfo?.os_distribution || 'Linux'} ·{' '}
+              {activeServer.kernel_info || agentInfo?.kernel || '6.x'} · Uptime:{' '}
+              {activeServer.uptime_info ||
+                (monitoring?.summary?.uptime_seconds
+                  ? formatUptimeDuration(monitoring.summary.uptime_seconds)
+                  : '—')}
             </p>
           </div>
 

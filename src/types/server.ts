@@ -255,6 +255,9 @@ export interface PrometheusMetricPoint {
   net_rx_kbps: number;
   net_tx_kbps: number;
   uptime_seconds: number;
+  load1?: number;
+  load5?: number;
+  load15?: number;
 }
 
 export interface ServerMonitoringResponse {
@@ -262,7 +265,11 @@ export interface ServerMonitoringResponse {
   range: MonitoringTimeRange;
   step_seconds: number;
   source: 'prometheus' | 'agent_tsdb';
+  prometheus_connected?: boolean;
+  exporter_type?: string;
+  agent_status?: AgentInstallStatus;
   scrape_target: string;
+  raw_metrics_preview?: string[];
   promql_queries: {
     cpu: string;
     memory: string;
@@ -270,6 +277,7 @@ export interface ServerMonitoringResponse {
     network_rx: string;
     network_tx: string;
     uptime: string;
+    load?: string;
   };
   summary: {
     current_cpu_percent: number;
@@ -278,6 +286,9 @@ export interface ServerMonitoringResponse {
     current_rx_kbps: number;
     current_tx_kbps: number;
     uptime_seconds: number;
+    load1?: number;
+    load5?: number;
+    load15?: number;
   };
   series: PrometheusMetricPoint[];
 }

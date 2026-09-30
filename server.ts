@@ -25,10 +25,12 @@ import {
   recordAgentHeartbeat,
   recordAgentSystemInfo,
   rotateServerEnrollmentToken,
+  stopServerAgent,
   verifyAgentCredential,
 } from './src/db/agents.ts';
 import { PORTABLE_AGENT_SCRIPT } from './src/server/portableAgentScript.ts';
 import {
+  clearServerPrometheusCache,
   fetchServerMonitoringMetrics,
   parseMonitoringTimeRange,
 } from './src/server/prometheusClient.ts';
@@ -1537,7 +1539,12 @@ export function createApp() {
         ? Date.now() - new Date(agentView.last_seen_at).getTime()
         : Infinity;
 
-      if (agentView.agent_id && lastSeenAgeMs > 25000 && server.encryptedSecret) {
+      if (
+        agentView.agent_id &&
+        agentView.version !== 'stopped' &&
+        lastSeenAgeMs > 25000 &&
+        server.encryptedSecret
+      ) {
         try {
           const checkExec = await executeSshCommand({
             ipAddress: server.ipAddress,
@@ -1741,6 +1748,54 @@ WantedBy=multi-user.target
       console.error('POST /api/servers/:id/agent/install-ssh failed:', error);
       return res.status(500).json({
         error: error?.message || 'Failed to install agent via SSH',
+      });
+    }
+  });
+
+  app.post('/api/servers/:id/agent/stop', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid server ID' });
+      }
+
+      const server = await getServerById(id, uid);
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+
+      if (server.encryptedSecret) {
+        try {
+          const stopCmd = [
+            'SUDO=""; if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi',
+            'if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then',
+            '  $SUDO systemctl stop infralab-agent >/dev/null 2>&1 || true',
+            '  $SUDO systemctl disable infralab-agent >/dev/null 2>&1 || true',
+            'fi',
+            '$SUDO pkill -f "/usr/local/bin/infralab-agent" >/dev/null 2>&1 || true',
+          ].join('\n');
+
+          await executeSshCommand({
+            ipAddress: server.ipAddress,
+            sshPort: server.sshPort,
+            username: server.username,
+            authType: server.authType === 'private_key' ? 'private_key' : 'password',
+            encryptedSecret: server.encryptedSecret,
+            command: stopCmd,
+          });
+        } catch {
+          // Even if SSH stop fails or server is unreachable, disable polling in DB
+        }
+      }
+
+      clearServerPrometheusCache(server.id);
+      const stoppedView = await stopServerAgent(server.id);
+      return res.status(200).json(stoppedView);
+    } catch (error: any) {
+      console.error('POST /api/servers/:id/agent/stop failed:', error);
+      return res.status(500).json({
+        error: error?.message || 'Failed to stop agent on server',
       });
     }
   });

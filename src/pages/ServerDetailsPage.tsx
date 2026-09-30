@@ -15,6 +15,7 @@ import {
   Eye,
   EyeOff,
   Play,
+  Square,
   CheckCircle2,
   XCircle,
   ArrowUpRight,
@@ -28,6 +29,7 @@ import {
   useServer,
   useServerAgent,
   useServerCommandLogs,
+  useStopServerAgentViaSsh,
   useUpdateServerCredentials,
 } from '../hooks/useServers.ts';
 import { SshAuthType, SshCommandLog } from '../types/server.ts';
@@ -70,6 +72,7 @@ export const ServerDetailsPage: React.FC = () => {
   const execMutation = useExecuteSshCommand();
   const rotateTokenMutation = useRotateServerAgentToken();
   const installAgentSshMutation = useInstallServerAgentViaSsh();
+  const stopAgentSshMutation = useStopServerAgentViaSsh();
   const { t } = useI18n();
 
   const [copiedSsh, setCopiedSsh] = useState(false);
@@ -727,10 +730,47 @@ export const ServerDetailsPage: React.FC = () => {
                 {installAgentSshMutation.isPending
                   ? t('Установка по SSH...', 'Installing via SSH...')
                   : agentInfo?.status === 'ONLINE'
-                  ? t('Переустановить агент по SSH', 'Reinstall Agent via SSH')
+                  ? t('Перезапустить агент по SSH', 'Restart Agent via SSH')
+                  : agentInfo?.version === 'stopped'
+                  ? t('Включить агент по SSH', 'Start Agent via SSH')
                   : t('Установить агент по SSH в 1 клик', '1-Click Install Agent via SSH')}
               </span>
             </button>
+
+            {agentInfo &&
+              (agentInfo.status === 'ONLINE' ||
+                (agentInfo.agent_id && agentInfo.version !== 'stopped')) && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setAgentInstallMsg(null);
+                    setAgentInstallErr(null);
+                    try {
+                      await stopAgentSshMutation.mutateAsync(server.id);
+                      setAgentInstallMsg(
+                        t(
+                          'Агент остановлен на сервере по SSH, фоновый опрос и сбор метрик отключены.',
+                          'Agent stopped on server via SSH, background polling disabled.'
+                        )
+                      );
+                    } catch (err: any) {
+                      setAgentInstallErr(
+                        err?.message ||
+                          t('Не удалось остановить агент', 'Failed to stop agent')
+                      );
+                    }
+                  }}
+                  disabled={stopAgentSshMutation.isPending}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-rose-500/40 bg-rose-950/30 px-3 py-1.5 text-xs font-semibold text-rose-300 transition-colors hover:bg-rose-950/60 disabled:opacity-50"
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                  <span>
+                    {stopAgentSshMutation.isPending
+                      ? t('Остановка агента...', 'Stopping Agent...')
+                      : t('Выключить агент', 'Stop Agent')}
+                  </span>
+                </button>
+              )}
 
             <Link
               to={`/servers/${server.id}/monitoring`}

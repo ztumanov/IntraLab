@@ -396,6 +396,23 @@ export async function installServerAgentViaSsh(id: number): Promise<ServerAgentI
   return response.json();
 }
 
+export async function stopServerAgentViaSsh(id: number): Promise<ServerAgentInfo> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`/api/servers/${id}/agent/stop`, {
+    method: 'POST',
+    headers,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new ApiRequestError(
+      body.error || 'Failed to stop agent over SSH',
+      response.status,
+      body.details
+    );
+  }
+  return response.json();
+}
+
 export async function fetchServerMonitoring(
   id: number,
   range: MonitoringTimeRange = '1h'
