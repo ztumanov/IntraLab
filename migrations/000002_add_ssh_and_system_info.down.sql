@@ -1,0 +1,15 @@
+ALTER TABLE servers
+    DROP COLUMN IF EXISTS auth_type,
+    DROP COLUMN IF EXISTS encrypted_secret,
+    DROP COLUMN IF EXISTS last_checked_at,
+    DROP COLUMN IF EXISTS last_error,
+    DROP COLUMN IF EXISTS latency_ms,
+    DROP COLUMN IF EXISTS os_info,
+    DROP COLUMN IF EXISTS kernel,
+    DROP COLUMN IF EXISTS architecture,
+    DROP COLUMN IF EXISTS cpu_cores,
+    DROP COLUMN IF EXISTS memory_total_mb,
+    DROP COLUMN IF EXISTS memory_used_mb,
+    DROP COLUMN IF EXISTS disk_total_gb,
+    DROP COLUMN IF EXISTS disk_used_percent,
+    DROP COLUMN IF EXISTS uptime;

@@ -1,0 +1,29 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    platform: "infralab"
+
+scrape_configs:
+  # Self-monitoring of Prometheus server
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Dynamic HTTP Service Discovery for enrolled InfraLab Linux Agents
+  # Never hardcodes server IPs: Prometheus polls InfraLab for active enrolled agents.
+  - job_name: "infralab-agents"
+    metrics_path: /metrics
+    scheme: http
+    http_sd_configs:
+      - url: "http://infralab:3000/api/prometheus/targets"
+        refresh_interval: 15s
+    relabel_configs:
+      - source_labels: [__meta_infralab_server_id]
+        target_label: server_id
+      - source_labels: [__meta_infralab_agent_id]
+        target_label: agent_id
+      - source_labels: [__meta_infralab_hostname]
+        target_label: hostname
+      - source_labels: [__meta_infralab_server_name]
+        target_label: server_name

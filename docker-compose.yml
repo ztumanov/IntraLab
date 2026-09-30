@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: infralab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-infralab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-infralab_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-infralab}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-infralab} -d ${POSTGRES_DB:-infralab}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: infralab-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}"
+      - "--storage.tsdb.retention.size=5GB"
+      - "--web.enable-lifecycle"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
+  infralab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_GOOGLE_MAPS_API_KEY: ${VITE_GOOGLE_MAPS_API_KEY:-}
+    container_name: infralab-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATABASE_URL: postgres://${POSTGRES_USER:-infralab}:${POSTGRES_PASSWORD:-infralab_secret}@postgres:5432/${POSTGRES_DB:-infralab}
+      SQL_HOST: postgres
+      SQL_PORT: "5432"
+      SQL_USER: ${POSTGRES_USER:-infralab}
+      SQL_PASSWORD: ${POSTGRES_PASSWORD:-infralab_secret}
+      SQL_DB_NAME: ${POSTGRES_DB:-infralab}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-infralab-aes256-gcm-master-secret-key-2026}
+      PROMETHEUS_URL: http://prometheus:9090
+      OPERATOR_EMAIL: ${OPERATOR_EMAIL:-operator@infralab.local}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+
+volumes:
+  postgres_data:
+  prometheus_data:

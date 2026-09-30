@@ -1,0 +1,26 @@
+[Unit]
+Description=InfraLab Linux Telemetry & Heartbeat Agent
+Documentation=https://github.com/infralab/infralab/blob/main/docs/agent.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/infralab-agent run --config /etc/infralab-agent/config.json --credentials /etc/infralab-agent/credentials.json
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=infralab-agent
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

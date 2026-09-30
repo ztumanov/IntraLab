@@ -1,0 +1,6 @@
+{
+  "name": "InfraLab",
+  "description": "Self-hosted Linux infrastructure management and observability platform — Server Inventory, topology, containers, and telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
