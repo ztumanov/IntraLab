@@ -1,9 +1,11 @@
 import express from 'express';
+import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
 import { ensureDatabaseSchema } from './src/db/bootstrap.ts';
+import { attachTerminalWebSocketServer } from './src/server/wsTerminal.ts';
 import {
   listServersByUser,
   getServerById,
@@ -1249,6 +1251,9 @@ export function createApp() {
 async function startServer() {
   await ensureDatabaseSchema();
   const app = createApp();
+  const httpServer = http.createServer(app);
+  attachTerminalWebSocketServer(httpServer);
+
   const PORT = Number(process.env.PORT) || 3000;
 
   if (process.env.NODE_ENV !== 'production') {
@@ -1265,7 +1270,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`InfraLab server running on http://0.0.0.0:${PORT}`);
   });
 }

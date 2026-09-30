@@ -31,6 +31,7 @@ import {
 } from '../hooks/useServers.ts';
 import { SshAuthType, SshCommandLog } from '../types/server.ts';
 import { useI18n } from '../context/I18nContext.tsx';
+import { WebSocketTerminal } from '../components/WebSocketTerminal.tsx';
 
 const SAMPLE_OPENSSH_KEY = `-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
@@ -81,6 +82,7 @@ export const ServerDetailsPage: React.FC = () => {
   const [credsError, setCredsError] = useState<string | null>(null);
 
   // SSH Command Console State
+  const [terminalTab, setTerminalTab] = useState<'pty' | 'exec'>('pty');
   const [commandInput, setCommandInput] = useState('uname -a && uptime && free -m');
   const [selectedLog, setSelectedLog] = useState<SshCommandLog | null>(null);
 
@@ -894,24 +896,53 @@ export const ServerDetailsPage: React.FC = () => {
         )}
       </section>
 
-      {/* Interactive SSH Command Console */}
+      {/* Interactive WebSocket PTY Terminal & SSH Command Console */}
       <section className="rounded-lg border border-slate-800 bg-[#1E293B] p-6 space-y-5">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
           <div className="flex items-center gap-2">
             <Terminal className="h-4 w-4 text-emerald-400" />
             <h2 className="text-base font-semibold text-slate-100">
               {t(
-                'SSH-консоль выполнения команд (Remote Exec)',
-                'SSH Command Runner (Remote Exec)'
+                'Интерактивный WebSocket PTY-терминал и SSH-консоль',
+                'Interactive WebSocket PTY Terminal & SSH Console'
               )}
             </h2>
           </div>
-          <span className="font-mono text-xs text-slate-400">
-            {server.username}@{server.hostname}
-          </span>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="inline-flex items-center rounded-md border border-slate-800 bg-[#0F172A] p-1">
+              <button
+                type="button"
+                onClick={() => setTerminalTab('pty')}
+                className={`rounded px-3 py-1 text-xs font-semibold transition-colors ${
+                  terminalTab === 'pty'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {t('Интерактивный PTY (xterm.js)', 'Interactive PTY (xterm.js)')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setTerminalTab('exec')}
+                className={`rounded px-3 py-1 text-xs font-semibold transition-colors ${
+                  terminalTab === 'exec'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {t('Пакетный Exec и Журнал аудита', 'Batch Exec & Audit Log')} (
+                {commandLogs.length})
+              </button>
+            </div>
+          </div>
         </div>
 
-        {/* Quick preset command buttons */}
+        {terminalTab === 'pty' ? (
+          <WebSocketTerminal server={server} />
+        ) : (
+          <>
+            {/* Quick preset command buttons */}
         <div>
           <p className="text-xs font-medium text-slate-400 mb-2">
             {t('Быстрые диагностические команды:', 'Quick diagnostic presets:')}
@@ -1065,6 +1096,8 @@ export const ServerDetailsPage: React.FC = () => {
             </div>
           )}
         </div>
+          </>
+        )}
       </section>
     </div>
   );
