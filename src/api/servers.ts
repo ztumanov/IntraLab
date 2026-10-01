@@ -167,9 +167,12 @@ export async function checkAllServers(): Promise<Server[]> {
   return response.json();
 }
 
-export async function fetchServerTelemetry(id: number): Promise<LiveTelemetryResponse> {
+export async function fetchServerTelemetry(
+  id: number,
+  signal?: AbortSignal
+): Promise<LiveTelemetryResponse> {
   const headers = await getAuthHeaders();
-  const response = await fetch(`/api/servers/${id}/telemetry`, { headers });
+  const response = await fetch(`/api/servers/${id}/telemetry`, { headers, signal });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new ApiRequestError(
@@ -417,12 +420,13 @@ export async function stopServerAgentViaSsh(id: number): Promise<ServerAgentInfo
 
 export async function fetchServerMonitoring(
   id: number,
-  range: MonitoringTimeRange = '1h'
+  range: MonitoringTimeRange = '1h',
+  signal?: AbortSignal
 ): Promise<ServerMonitoringResponse> {
   const headers = await getAuthHeaders();
   const response = await fetch(
     `/api/servers/${id}/metrics?range=${encodeURIComponent(range)}`,
-    { headers }
+    { headers, signal }
   );
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));

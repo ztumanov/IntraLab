@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
   Activity,
@@ -44,7 +44,7 @@ export function formatUptimeDuration(seconds: number): string {
 function formatAxisTimestamp(iso: string, range: MonitoringTimeRange): string {
   try {
     const d = new Date(iso);
-    if (range === '7d') {
+    if (range === '7d' || range === '24h') {
       return d.toISOString().slice(5, 16).replace('T', ' ');
     }
     return d.toISOString().slice(11, 16);
@@ -116,6 +116,9 @@ export const SinglePromChartCard: React.FC<SingleMetricChartProps> = ({
   formatDetail,
 }) => {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  useEffect(() => {
+    setHoverIdx(null);
+  }, [range]);
   const width = 540;
   const height = 190;
 
@@ -323,6 +326,9 @@ export const NetworkRxTxChartCard: React.FC<NetworkRxTxChartProps> = ({
 }) => {
   const { t } = useI18n();
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  useEffect(() => {
+    setHoverIdx(null);
+  }, [range]);
   const width = 540;
   const height = 190;
 
@@ -559,20 +565,55 @@ export const ServerMonitoringPage: React.FC = () => {
   const serverId = Number(id);
 
   const [range, setRange] = useState<MonitoringTimeRange>('1h');
+  const [isManualRefreshing, setIsManualRefreshing] = useState<boolean>(false);
 
   const { data: server, isLoading: isServerLoading } = useServer(serverId);
   const { data: agentInfo } = useServerAgent(serverId);
   const {
     data: monitoring,
     isLoading: isMonitoringLoading,
-    isFetching: isMonitoringFetching,
     refetch: refetchMonitoring,
-  } = useServerMonitoring(serverId, range, 15000);
+  } = useServerMonitoring(serverId, range, false);
 
-  if (isServerLoading || isMonitoringLoading) {
+  const handleRefreshPromQL = async () => {
+    if (isManualRefreshing) return;
+    setIsManualRefreshing(true);
+    try {
+      await refetchMonitoring();
+    } finally {
+      setIsManualRefreshing(false);
+    }
+  };
+
+  if (isServerLoading || (isMonitoringLoading && !monitoring)) {
     return (
       <div className="space-y-6">
-        <div className="h-7 w-64 animate-pulse rounded bg-slate-800" />
+        <div className="flex flex-col gap-4 border-b border-slate-800 pb-5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="h-7 w-64 animate-pulse rounded bg-slate-800" />
+          <div
+            role="group"
+            aria-label="Monitoring time range"
+            className="inline-flex items-center rounded-md border border-slate-800 bg-[#0F172A] p-1 self-start sm:self-auto"
+          >
+            {TIME_RANGES.map((item) => {
+              const active = range === item.key;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => setRange(item.key)}
+                  className={`rounded px-3 py-1 font-mono text-xs font-semibold transition-colors ${
+                    active
+                      ? 'bg-emerald-600 text-white'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {item.key}
+                </button>
+              );
+            })}
+          </div>
+        </div>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
           <div className="h-24 animate-pulse rounded-lg bg-[#1E293B]" />
           <div className="h-24 animate-pulse rounded-lg bg-[#1E293B]" />
@@ -671,13 +712,13 @@ export const ServerMonitoringPage: React.FC = () => {
 
           <button
             type="button"
-            onClick={() => refetchMonitoring()}
-            disabled={isMonitoringFetching}
+            onClick={handleRefreshPromQL}
+            disabled={isManualRefreshing}
             className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#1E293B] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-800 disabled:opacity-60"
           >
             <RefreshCw
               className={`h-3.5 w-3.5 text-emerald-400 ${
-                isMonitoringFetching ? 'animate-spin' : ''
+                isManualRefreshing ? 'animate-spin' : ''
               }`}
             />
             <span>{t('Обновить PromQL', 'Refresh PromQL')}</span>

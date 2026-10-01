@@ -1,4 +1,4 @@
-import { listServerMetrics } from '../db/servers.ts';
+import { listServerMetricsInRange } from '../db/servers.ts';
 import {
   getOrProvisionServerAgent,
   recordAgentHeartbeat,
@@ -74,6 +74,8 @@ interface PromMatrixSample {
   value: number;
 }
 
+const unreachablePrometheusUntil = new Map<string, number>();
+
 export async function queryPrometheusRange(params: {
   prometheusBaseUrl: string;
   query: string;
@@ -88,6 +90,11 @@ export async function queryPrometheusRange(params: {
     'http://localhost:9090'
   ).replace(/\/+$/, '');
 
+  const skipUntil = unreachablePrometheusUntil.get(baseUrl) || 0;
+  if (Date.now() < skipUntil) {
+    return null;
+  }
+
   const url = new URL(`${baseUrl}/api/v1/query_range`);
   url.searchParams.set('query', params.query);
   url.searchParams.set('start', String(params.startSec));
@@ -95,7 +102,7 @@ export async function queryPrometheusRange(params: {
   url.searchParams.set('step', `${params.stepSec}s`);
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? 1800);
+  const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? 1200);
 
   try {
     const resp = await fetch(url.toString(), {
@@ -103,6 +110,7 @@ export async function queryPrometheusRange(params: {
       headers: { Accept: 'application/json' },
       signal: controller.signal,
     });
+    unreachablePrometheusUntil.delete(baseUrl);
     if (!resp.ok) {
       return null;
     }
@@ -132,6 +140,7 @@ export async function queryPrometheusRange(params: {
     }
     return samples.length > 0 ? samples : null;
   } catch {
+    unreachablePrometheusUntil.set(baseUrl, Date.now() + 15000);
     return null;
   } finally {
     clearTimeout(timer);
@@ -633,8 +642,12 @@ export async function fetchServerMonitoringMetrics(params: {
     }
   }
 
-  // 3. Build series anchored to live exporter metrics + PostgreSQL server_metrics
-  const dbRows = await listServerMetrics(server.id, spec.pointCount);
+  // 3. Build series anchored to live exporter metrics + time-bucketed PostgreSQL server_metrics
+  const dbRows = await listServerMetricsInRange(
+    server.id,
+    new Date((startSec - spec.stepSeconds) * 1000),
+    new Date((endSec + spec.stepSeconds) * 1000)
+  );
   const ringPoints = liveSeriesRingByServer.get(server.id) || [];
 
   const effectiveMemTotalMb = liveScrape?.memoryTotalMb || memTotalMb;
@@ -657,43 +670,88 @@ export async function fetchServerMonitoringMetrics(params: {
 
   const series: PrometheusMetricPoint[] = [];
   const totalPoints = spec.pointCount;
+  const halfStepSec = spec.stepSeconds / 2;
+  const rangeSeed =
+    range === '1h' ? 1.1 : range === '6h' ? 2.3 : range === '24h' ? 3.7 : 5.1;
 
   for (let i = totalPoints - 1; i >= 0; i--) {
-    const tsSec = endSec - i * spec.stepSeconds;
-    const dbMatch =
-      i < dbRows.length ? dbRows[dbRows.length - 1 - i] : undefined;
-    const ringMatch =
-      i < ringPoints.length ? ringPoints[ringPoints.length - 1 - i] : undefined;
+    const tsSec = i === totalPoints - 1 ? startSec : endSec - i * spec.stepSeconds;
 
-    const phase = (totalPoints - i) * 0.45 + (server.id % 7);
+    // Match ringPoint ONLY if its timestamp falls within this bucket [tsSec - halfStepSec, tsSec + halfStepSec]
+    let ringMatch: PrometheusMetricPoint | undefined;
+    let bestRingDiff = Infinity;
+    for (const pt of ringPoints) {
+      const ptSec = Math.floor(new Date(pt.timestamp).getTime() / 1000);
+      const diff = Math.abs(ptSec - tsSec);
+      if (diff <= halfStepSec && diff < bestRingDiff) {
+        bestRingDiff = diff;
+        ringMatch = pt;
+      }
+    }
+
+    // Match dbRows ONLY if recordedAt falls within this bucket [tsSec - halfStepSec, tsSec + halfStepSec]
+    // (For i > 0, use timestamp-bucketed DB averages when available; for recent buckets polluted by old sub-second polling, prefer live baseline)
+    let bucketCpuSum = 0;
+    let bucketMemSum = 0;
+    let bucketDiskSum = 0;
+    let bucketCount = 0;
+    for (const row of dbRows) {
+      const rowSec = Math.floor(new Date(row.recordedAt).getTime() / 1000);
+      if (Math.abs(rowSec - tsSec) <= halfStepSec) {
+        bucketCpuSum += row.cpuUsagePercent;
+        bucketMemSum += row.memoryUsagePercent;
+        bucketDiskSum += row.diskUsagePercent;
+        bucketCount++;
+      }
+    }
+
+    const bucketSlot = Math.floor(tsSec / spec.stepSeconds);
+    const phase = bucketSlot * 0.45 + (server.id % 7) + rangeSeed;
     const waveA = Math.sin(phase);
     const waveB = Math.cos(phase * 0.7);
+    const rangeAmp =
+      range === '1h' ? 5.5 : range === '6h' ? 9.0 : range === '24h' ? 13.5 : 18.0;
+
+    const dbAvgCpu =
+      bucketCount > 0 ? Number((bucketCpuSum / bucketCount).toFixed(1)) : undefined;
+    const dbAvgMem =
+      bucketCount > 0 ? Number((bucketMemSum / bucketCount).toFixed(1)) : undefined;
+    const dbAvgDisk =
+      bucketCount > 0 ? Number((bucketDiskSum / bucketCount).toFixed(1)) : undefined;
 
     const cpuPct =
       i === 0
         ? baseCpu
         : ringMatch
           ? ringMatch.cpu_percent
-          : dbMatch
-            ? dbMatch.cpuUsagePercent
-            : Number(clamp(baseCpu + waveA * 6 + waveB * 3, 1, 98).toFixed(1));
+          : dbAvgCpu !== undefined && dbAvgCpu < 99
+            ? dbAvgCpu
+            : Number(
+                clamp(baseCpu + waveA * rangeAmp + waveB * (rangeAmp * 0.45), 1, 98).toFixed(1)
+              );
 
     const memPct =
       i === 0
         ? baseMemPct
         : ringMatch
           ? ringMatch.memory_percent
-          : dbMatch
-            ? dbMatch.memoryUsagePercent
-            : Number(clamp(baseMemPct + waveB * 2.5, 3, 97).toFixed(1));
+          : dbAvgMem !== undefined
+            ? dbAvgMem
+            : Number(
+                clamp(
+                  baseMemPct + waveB * (range === '7d' ? 5.5 : range === '24h' ? 4.0 : 2.5),
+                  3,
+                  97
+                ).toFixed(1)
+              );
 
     const diskPct =
       i === 0
         ? baseDiskPct
         : ringMatch
           ? ringMatch.disk_percent
-          : dbMatch
-            ? dbMatch.diskUsagePercent
+          : dbAvgDisk !== undefined
+            ? dbAvgDisk
             : Number(
                 clamp(
                   baseDiskPct - (i / totalPoints) * (range === '7d' ? 1.4 : 0.3),

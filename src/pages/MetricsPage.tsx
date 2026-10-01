@@ -61,6 +61,7 @@ export const MetricsPage: React.FC = () => {
   const [autoPoll, setAutoPoll] = useState<boolean>(false);
   const [promRange, setPromRange] = useState<MonitoringTimeRange>('1h');
   const [showPromQueries, setShowPromQueries] = useState<boolean>(false);
+  const [isManualRefreshingPromQL, setIsManualRefreshingPromQL] = useState<boolean>(false);
   const [activeSubTab, setActiveSubTab] = useState<'processes' | 'disks' | 'network'>(
     'processes'
   );
@@ -100,7 +101,7 @@ export const MetricsPage: React.FC = () => {
 
   const {
     data: monitoring,
-    isFetching: isFetchingMonitoring,
+    isLoading: isLoadingMonitoring,
     isError: isMonitoringError,
     error: monitoringError,
     refetch: refetchMonitoring,
@@ -109,6 +110,16 @@ export const MetricsPage: React.FC = () => {
     promRange,
     autoPoll ? 10000 : false
   );
+
+  const handleRefreshPromQL = async () => {
+    if (isManualRefreshingPromQL) return;
+    setIsManualRefreshingPromQL(true);
+    try {
+      await refetchMonitoring();
+    } finally {
+      setIsManualRefreshingPromQL(false);
+    }
+  };
 
   const handlePollSelected = async () => {
     if (!selectedServer) return;
@@ -278,18 +289,18 @@ export const MetricsPage: React.FC = () => {
           <button
             type="button"
             onClick={handlePollSelected}
-            disabled={checkOneMutation.isPending || isFetchingTelemetry || isFetchingMonitoring}
+            disabled={checkOneMutation.isPending || isFetchingTelemetry}
             className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-60 whitespace-nowrap"
           >
             <RefreshCw
               className={`h-3.5 w-3.5 ${
-                checkOneMutation.isPending || isFetchingTelemetry || isFetchingMonitoring
+                checkOneMutation.isPending || isFetchingTelemetry
                   ? 'animate-spin'
                   : ''
               }`}
             />
             <span>
-              {checkOneMutation.isPending || isFetchingTelemetry || isFetchingMonitoring
+              {checkOneMutation.isPending || isFetchingTelemetry
                 ? t('Сбор метрик...', 'Polling Metrics...')
                 : t('Обновить метрики узла', 'Refresh Node Telemetry')}
             </span>
@@ -539,7 +550,7 @@ export const MetricsPage: React.FC = () => {
       </div>
 
       {/* PROMETHEUS GRAPHS SECTION (Shown automatically when connected on the host, or with 1-click installer if not connected) */}
-      {isPrometheusConnected && monitoring ? (
+      {isPrometheusConnected && (monitoring || isLoadingMonitoring) ? (
         <section className="rounded-lg border border-emerald-500/30 bg-[#1E293B] p-6 space-y-6">
           {/* Prometheus Section Header & Time Range Controls */}
           <div className="flex flex-col gap-4 border-b border-slate-800 pb-4 lg:flex-row lg:items-center lg:justify-between">
@@ -559,10 +570,13 @@ export const MetricsPage: React.FC = () => {
               <p className="font-mono text-xs text-slate-400">
                 Exporter:{' '}
                 <span className="text-emerald-400 font-semibold">
-                  {monitoring.exporter_type || 'infralab-agent (:9101/metrics)'}
+                  {monitoring?.exporter_type || 'infralab-agent (:9101/metrics)'}
                 </span>
                 {' · '}
-                Target: <span className="text-slate-200">http://{monitoring.scrape_target}</span>
+                Target:{' '}
+                <span className="text-slate-200">
+                  http://{monitoring?.scrape_target || `${activeServer.ip_address}:9101/metrics`}
+                </span>
                 {agentInfo?.agent_id && (
                   <>
                     {' · '}
@@ -600,13 +614,13 @@ export const MetricsPage: React.FC = () => {
 
               <button
                 type="button"
-                onClick={() => refetchMonitoring()}
-                disabled={isFetchingMonitoring}
+                onClick={handleRefreshPromQL}
+                disabled={isManualRefreshingPromQL || isLoadingMonitoring}
                 className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#0F172A] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-800 disabled:opacity-60"
               >
                 <RefreshCw
                   className={`h-3.5 w-3.5 text-emerald-400 ${
-                    isFetchingMonitoring ? 'animate-spin' : ''
+                    isManualRefreshingPromQL ? 'animate-spin' : ''
                   }`}
                 />
                 <span>{t('Обновить PromQL', 'Refresh PromQL')}</span>
@@ -637,166 +651,177 @@ export const MetricsPage: React.FC = () => {
             </div>
           </div>
 
-          {/* Prometheus Live Summary Strip */}
-          <div className="grid grid-cols-2 gap-3 rounded-lg border border-slate-800 bg-[#0F172A] p-3.5 sm:grid-cols-3 lg:grid-cols-6 font-mono text-xs tabular-nums">
-            <div>
-              <span className="text-slate-400 block text-[11px]">PromQL CPU</span>
-              <span className="text-emerald-400 font-semibold text-sm mt-0.5 block">
-                {monitoring.summary.current_cpu_percent}%
-              </span>
+          {!monitoring ? (
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+              <div className="h-64 animate-pulse rounded-lg border border-slate-800 bg-[#0F172A]/60" />
+              <div className="h-64 animate-pulse rounded-lg border border-slate-800 bg-[#0F172A]/60" />
+              <div className="h-64 animate-pulse rounded-lg border border-slate-800 bg-[#0F172A]/60" />
+              <div className="h-64 animate-pulse rounded-lg border border-slate-800 bg-[#0F172A]/60" />
             </div>
-            <div>
-              <span className="text-slate-400 block text-[11px]">PromQL Memory</span>
-              <span className="text-sky-400 font-semibold text-sm mt-0.5 block">
-                {monitoring.summary.current_memory_percent}%
-              </span>
-            </div>
-            <div>
-              <span className="text-slate-400 block text-[11px]">PromQL Disk (/)</span>
-              <span className="text-amber-400 font-semibold text-sm mt-0.5 block">
-                {monitoring.summary.current_disk_percent}%
-              </span>
-            </div>
-            <div>
-              <span className="text-slate-400 block text-[11px]">Net RX / TX</span>
-              <span className="text-violet-300 font-semibold text-xs mt-0.5 block">
-                ↓{monitoring.summary.current_rx_kbps} · ↑{monitoring.summary.current_tx_kbps} KB/s
-              </span>
-            </div>
-            <div>
-              <span className="text-slate-400 block text-[11px]">Load Avg (1/5/15m)</span>
-              <span className="text-slate-100 font-semibold text-xs mt-0.5 block">
-                {monitoring.summary.load1 ?? 0.22} / {monitoring.summary.load5 ?? 0.18} /{' '}
-                {monitoring.summary.load15 ?? 0.14}
-              </span>
-            </div>
-            <div>
-              <span className="text-slate-400 flex items-center gap-1 text-[11px]">
-                <Clock className="h-3 w-3 text-emerald-400" />
-                Exporter Uptime
-              </span>
-              <span className="text-emerald-400 font-semibold text-sm mt-0.5 block">
-                {formatUptimeDuration(monitoring.summary.uptime_seconds)}
-              </span>
-            </div>
-          </div>
-
-          {/* 4 Interactive Prometheus Charts Grid */}
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-            <SinglePromChartCard
-              title={t('Prometheus: Загрузка CPU (CPU Usage)', 'Prometheus: CPU Usage')}
-              subtitle={t(
-                `Окно ${promRange} · Шаг ${monitoring.step_seconds}s · infralab-agent`,
-                `Window ${promRange} · Step ${monitoring.step_seconds}s · infralab-agent`
-              )}
-              promql={monitoring.promql_queries.cpu}
-              unit="%"
-              colorHex="#10B981"
-              gradientId="metricsPromCpuGrad"
-              series={monitoring.series}
-              range={promRange}
-              maxValue={100}
-              getValue={(pt) => pt.cpu_percent}
-            />
-
-            <SinglePromChartCard
-              title={t('Prometheus: Память RAM (Memory Usage)', 'Prometheus: Memory Usage')}
-              subtitle={t(
-                `Физическая память RAM (${memTotal} MB total)`,
-                `Physical RAM utilization (${memTotal} MB total)`
-              )}
-              promql={monitoring.promql_queries.memory}
-              unit="%"
-              colorHex="#38BDF8"
-              gradientId="metricsPromMemGrad"
-              series={monitoring.series}
-              range={promRange}
-              maxValue={100}
-              getValue={(pt) => pt.memory_percent}
-              formatDetail={(pt) => `${pt.memory_used_mb} / ${memTotal} MB`}
-            />
-
-            <SinglePromChartCard
-              title={t('Prometheus: Дисковый раздел / (Disk Usage)', 'Prometheus: Disk Usage')}
-              subtitle={t(
-                `Корневая ФС / (${totalDiskGb} GB total)`,
-                `Root filesystem / (${totalDiskGb} GB total)`
-              )}
-              promql={monitoring.promql_queries.disk}
-              unit="%"
-              colorHex="#F59E0B"
-              gradientId="metricsPromDiskGrad"
-              series={monitoring.series}
-              range={promRange}
-              maxValue={100}
-              getValue={(pt) => pt.disk_percent}
-              formatDetail={(pt) => `${pt.disk_used_gb} / ${totalDiskGb} GB`}
-            />
-
-            <NetworkRxTxChartCard
-              series={monitoring.series}
-              range={promRange}
-              promqlRx={monitoring.promql_queries.network_rx}
-              promqlTx={monitoring.promql_queries.network_tx}
-            />
-          </div>
-
-          {/* Optional PromQL & Raw Exporter Metrics Inspector */}
-          {showPromQueries && (
-            <div className="rounded-lg border border-slate-800 bg-[#0F172A] p-4 space-y-4 font-mono text-xs">
-              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
-                <span className="font-semibold text-slate-200">
-                  {t(
-                    'Активные PromQL-запросы и метрики экспортера на хосте (:9101/metrics)',
-                    'Active PromQL Queries & Live Host Exporter Metrics (:9101/metrics)'
-                  )}
-                </span>
-                <span className="text-emerald-400">
-                  http://{monitoring.scrape_target}
-                </span>
-              </div>
-
-              <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
-                <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
-                  <span className="text-slate-400 block text-[11px]">CPU PromQL:</span>
-                  <code className="text-emerald-300 break-all">
-                    {monitoring.promql_queries.cpu}
-                  </code>
-                </div>
-                <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
-                  <span className="text-slate-400 block text-[11px]">Memory PromQL:</span>
-                  <code className="text-sky-300 break-all">
-                    {monitoring.promql_queries.memory}
-                  </code>
-                </div>
-                <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
-                  <span className="text-slate-400 block text-[11px]">Disk PromQL:</span>
-                  <code className="text-amber-300 break-all">
-                    {monitoring.promql_queries.disk}
-                  </code>
-                </div>
-                <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
-                  <span className="text-slate-400 block text-[11px]">Network RX/TX PromQL:</span>
-                  <code className="text-violet-300 break-all">
-                    {monitoring.promql_queries.network_rx}
-                  </code>
-                </div>
-              </div>
-
-              {monitoring.raw_metrics_preview && monitoring.raw_metrics_preview.length > 0 && (
+          ) : (
+            <>
+              {/* Prometheus Live Summary Strip */}
+              <div className="grid grid-cols-2 gap-3 rounded-lg border border-slate-800 bg-[#0F172A] p-3.5 sm:grid-cols-3 lg:grid-cols-6 font-mono text-xs tabular-nums">
                 <div>
-                  <span className="text-slate-400 block text-[11px] mb-1.5">
-                    {t(
-                      'Срез живого ответа экспортера (/metrics) с хоста:',
-                      'Live scraped /metrics exposition output from host:'
-                    )}
+                  <span className="text-slate-400 block text-[11px]">PromQL CPU</span>
+                  <span className="text-emerald-400 font-semibold text-sm mt-0.5 block">
+                    {monitoring.summary.current_cpu_percent}%
                   </span>
-                  <pre className="max-h-48 overflow-y-auto rounded border border-slate-800 bg-[#0B1120] p-3 text-[11px] leading-relaxed text-emerald-300">
-                    {monitoring.raw_metrics_preview.join('\n')}
-                  </pre>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[11px]">PromQL Memory</span>
+                  <span className="text-sky-400 font-semibold text-sm mt-0.5 block">
+                    {monitoring.summary.current_memory_percent}%
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[11px]">PromQL Disk (/)</span>
+                  <span className="text-amber-400 font-semibold text-sm mt-0.5 block">
+                    {monitoring.summary.current_disk_percent}%
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[11px]">Net RX / TX</span>
+                  <span className="text-violet-300 font-semibold text-xs mt-0.5 block">
+                    ↓{monitoring.summary.current_rx_kbps} · ↑{monitoring.summary.current_tx_kbps} KB/s
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[11px]">Load Avg (1/5/15m)</span>
+                  <span className="text-slate-100 font-semibold text-xs mt-0.5 block">
+                    {monitoring.summary.load1 ?? 0.22} / {monitoring.summary.load5 ?? 0.18} /{' '}
+                    {monitoring.summary.load15 ?? 0.14}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-400 flex items-center gap-1 text-[11px]">
+                    <Clock className="h-3 w-3 text-emerald-400" />
+                    Exporter Uptime
+                  </span>
+                  <span className="text-emerald-400 font-semibold text-sm mt-0.5 block">
+                    {formatUptimeDuration(monitoring.summary.uptime_seconds)}
+                  </span>
+                </div>
+              </div>
+
+              {/* 4 Interactive Prometheus Charts Grid */}
+              <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+                <SinglePromChartCard
+                  title={t('Prometheus: Загрузка CPU (CPU Usage)', 'Prometheus: CPU Usage')}
+                  subtitle={t(
+                    `Окно ${promRange} · Шаг ${monitoring.step_seconds}s · infralab-agent`,
+                    `Window ${promRange} · Step ${monitoring.step_seconds}s · infralab-agent`
+                  )}
+                  promql={monitoring.promql_queries.cpu}
+                  unit="%"
+                  colorHex="#10B981"
+                  gradientId="metricsPromCpuGrad"
+                  series={monitoring.series}
+                  range={promRange}
+                  maxValue={100}
+                  getValue={(pt) => pt.cpu_percent}
+                />
+
+                <SinglePromChartCard
+                  title={t('Prometheus: Память RAM (Memory Usage)', 'Prometheus: Memory Usage')}
+                  subtitle={t(
+                    `Физическая память RAM (${memTotal} MB total)`,
+                    `Physical RAM utilization (${memTotal} MB total)`
+                  )}
+                  promql={monitoring.promql_queries.memory}
+                  unit="%"
+                  colorHex="#38BDF8"
+                  gradientId="metricsPromMemGrad"
+                  series={monitoring.series}
+                  range={promRange}
+                  maxValue={100}
+                  getValue={(pt) => pt.memory_percent}
+                  formatDetail={(pt) => `${pt.memory_used_mb} / ${memTotal} MB`}
+                />
+
+                <SinglePromChartCard
+                  title={t('Prometheus: Дисковый раздел / (Disk Usage)', 'Prometheus: Disk Usage')}
+                  subtitle={t(
+                    `Корневая ФС / (${totalDiskGb} GB total)`,
+                    `Root filesystem / (${totalDiskGb} GB total)`
+                  )}
+                  promql={monitoring.promql_queries.disk}
+                  unit="%"
+                  colorHex="#F59E0B"
+                  gradientId="metricsPromDiskGrad"
+                  series={monitoring.series}
+                  range={promRange}
+                  maxValue={100}
+                  getValue={(pt) => pt.disk_percent}
+                  formatDetail={(pt) => `${pt.disk_used_gb} / ${totalDiskGb} GB`}
+                />
+
+                <NetworkRxTxChartCard
+                  series={monitoring.series}
+                  range={promRange}
+                  promqlRx={monitoring.promql_queries.network_rx}
+                  promqlTx={monitoring.promql_queries.network_tx}
+                />
+              </div>
+
+              {/* Optional PromQL & Raw Exporter Metrics Inspector */}
+              {showPromQueries && (
+                <div className="rounded-lg border border-slate-800 bg-[#0F172A] p-4 space-y-4 font-mono text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+                    <span className="font-semibold text-slate-200">
+                      {t(
+                        'Активные PromQL-запросы и метрики экспортера на хосте (:9101/metrics)',
+                        'Active PromQL Queries & Live Host Exporter Metrics (:9101/metrics)'
+                      )}
+                    </span>
+                    <span className="text-emerald-400">
+                      http://{monitoring.scrape_target}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+                    <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
+                      <span className="text-slate-400 block text-[11px]">CPU PromQL:</span>
+                      <code className="text-emerald-300 break-all">
+                        {monitoring.promql_queries.cpu}
+                      </code>
+                    </div>
+                    <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
+                      <span className="text-slate-400 block text-[11px]">Memory PromQL:</span>
+                      <code className="text-sky-300 break-all">
+                        {monitoring.promql_queries.memory}
+                      </code>
+                    </div>
+                    <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
+                      <span className="text-slate-400 block text-[11px]">Disk PromQL:</span>
+                      <code className="text-amber-300 break-all">
+                        {monitoring.promql_queries.disk}
+                      </code>
+                    </div>
+                    <div className="rounded border border-slate-800 bg-[#1E293B]/60 p-2.5">
+                      <span className="text-slate-400 block text-[11px]">Network RX/TX PromQL:</span>
+                      <code className="text-violet-300 break-all">
+                        {monitoring.promql_queries.network_rx}
+                      </code>
+                    </div>
+                  </div>
+
+                  {monitoring.raw_metrics_preview && monitoring.raw_metrics_preview.length > 0 && (
+                    <div>
+                      <span className="text-slate-400 block text-[11px] mb-1.5">
+                        {t(
+                          'Срез живого ответа экспортера (/metrics) с хоста:',
+                          'Live scraped /metrics exposition output from host:'
+                        )}
+                      </span>
+                      <pre className="max-h-48 overflow-y-auto rounded border border-slate-800 bg-[#0B1120] p-3 text-[11px] leading-relaxed text-emerald-300">
+                        {monitoring.raw_metrics_preview.join('\n')}
+                      </pre>
+                    </div>
+                  )}
                 </div>
               )}
-            </div>
+            </>
           )}
         </section>
       ) : (

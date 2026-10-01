@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test --test-force-exit src/lib/validation.test.ts tests/localAuth.test.ts tests/agent.test.ts",
+    "test": "tsx --test --test-force-exit src/lib/validation.test.ts tests/localAuth.test.ts tests/agent.test.ts tests/monitoring.test.ts",
     "check": "tsx scripts/check.ts",
     "smoke": "tsx scripts/smoke.ts"
   },

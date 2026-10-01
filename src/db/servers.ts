@@ -1,4 +1,4 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, lte } from 'drizzle-orm';
 import { db } from './index.ts';
 import { serverMetrics, servers, sshCommandLogs } from './schema.ts';
 import { SshProbeResult } from '../server/sshConnector.ts';
@@ -204,6 +204,30 @@ export async function listServerMetrics(serverId: number, limit = 30) {
     return rows.reverse();
   } catch (error) {
     console.error('Database query failed in listServerMetrics:', error);
+    return [];
+  }
+}
+
+export async function listServerMetricsInRange(
+  serverId: number,
+  startDate: Date,
+  endDate: Date
+) {
+  try {
+    return await db
+      .select()
+      .from(serverMetrics)
+      .where(
+        and(
+          eq(serverMetrics.serverId, serverId),
+          gte(serverMetrics.recordedAt, startDate),
+          lte(serverMetrics.recordedAt, endDate)
+        )
+      )
+      .orderBy(asc(serverMetrics.recordedAt))
+      .limit(2000);
+  } catch (error) {
+    console.error('Database query failed in listServerMetricsInRange:', error);
     return [];
   }
 }

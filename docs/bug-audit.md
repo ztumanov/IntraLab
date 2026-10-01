@@ -158,6 +158,55 @@
 
 ---
 
+## BUG-008
+
+- **Component:** Monitoring / Prometheus Page — Кнопка «Обновить PromQL» и каскадная инвалидация TanStack Query (`src/hooks/useServers.ts`, `src/pages/MetricsPage.tsx`, `src/pages/ServerMonitoringPage.tsx`)
+- **Severity:** HIGH
+- **How to reproduce:**
+  1. Открыть страницу `Metrics & Prometheus Telemetry` (`/metrics`) или `/servers/:id/monitoring`.
+  2. Не нажимать никаких кнопок и наблюдать за кнопкой «Обновить PromQL» и вкладкой Network.
+- **Expected:**
+  - После начальной загрузки запросы завершаются, кнопка «Обновить PromQL» находится в состоянии покоя (`idle`) и переходит в состояние вращения/загрузки только при ручном клике пользователя (1 клик → 1 запрос → `idle`).
+- **Actual:**
+  - Кнопка «Обновить PromQL» постоянно мигала и вращалась каждые ~750 мс, а в Network непрерывно отправлялись запросы `/api/servers/2/telemetry`, `/api/servers/2/metrics`, `/api/servers` и `/api/servers/2/agent`.
+- **Root cause:**
+  - В `useServerTelemetry` (`src/hooks/useServers.ts:133`) внутри `queryFn` вызывался `queryClient.invalidateQueries({ queryKey: ['servers'] })` без `exact: true`. В TanStack Query v5 префиксное совпадение по ключу `['servers']` инвалидировало все активные запросы с префиксом `'servers'`, включая сам `['servers', id, 'telemetry']` и `['servers', id, 'monitoring', range]`. Кроме того, кнопка «Обновить PromQL» была привязана к общему флагу `isFetchingMonitoring` вместо выделенного состояния ручного обновления.
+- **Affected files:**
+  - `src/hooks/useServers.ts`
+  - `src/pages/MetricsPage.tsx`
+  - `src/pages/ServerMonitoringPage.tsx`
+- **Suggested minimal fix:**
+  - Заменить `queryClient.invalidateQueries({ queryKey: ['servers'] })` внутри `useServerTelemetry` на точечное обновление кэша `queryClient.setQueryData<Server[]>(['servers'], ...)` и привязать индикатор вращения кнопки «Обновить PromQL» к явному действию пользователя (`handleRefreshPromQL`).
+- **Status:** FIXED (добавлен регрессионный тест в `tests/monitoring.test.ts`).
+
+---
+
+## BUG-009
+
+- **Component:** Monitoring / Prometheus Time Range Switching `1h / 6h / 24h / 7d` (`src/server/prometheusClient.ts`, `src/db/servers.ts`, `src/hooks/useServers.ts`, `src/api/servers.ts`, `src/pages/ServerMonitoringPage.tsx`)
+- **Severity:** HIGH
+- **How to reproduce:**
+  1. На странице Monitoring переключать диапазоны `1h → 6h → 24h → 7d` (в том числе быстро подряд).
+  2. Сравнить точки графиков (`series`), временные метки первой/последней точки и подписи оси X.
+- **Expected:**
+  - Каждый диапазон (`1h`, `6h`, `24h`, `7d`) формирует временной ряд строго для своего окна `[now - duration, now]` и шага (`120s`, `600s`, `1800s`, `10800s`), точки `ringPoints` и `server_metrics` сопоставляются по принадлежности к временному бакету `[tsSec - step/2, tsSec + step/2]`, а при быстром переключении устаревшие HTTP-запросы отменяются через `AbortSignal`.
+- **Actual:**
+  - В `fetchServerMonitoringMetrics` (`src/server/prometheusClient.ts`) массивы `ringPoints` (точки за последние 1–2 минуты) и `dbRows` (`LIMIT N` последних записей БД) сопоставлялись с шагами графика по индексу массива `i` (`ringPoints[ringPoints.length - 1 - i]`), игнорируя реальные `timestamp` точек. В результате последние 30+ точек из окна `1h` без изменений подставлялись в графики `6h`, `24h` и `7d`. На оси X для `24h` обрезалась дата (`slice(11, 16)`), из-за чего `now - 24h` и `now` выглядели одинаково.
+- **Root cause:**
+  - Индексное сопоставление `ringPoints`/`dbRows` вместо сопоставления по `timestamp` бакета в `src/server/prometheusClient.ts`, отсутствие выборки по временному окну `listServerMetricsInRange` в `src/db/servers.ts` и отсутствие проброса `AbortSignal` из `useServerMonitoring` в `fetchServerMonitoring`.
+- **Affected files:**
+  - `src/server/prometheusClient.ts`
+  - `src/db/servers.ts`
+  - `src/hooks/useServers.ts`
+  - `src/api/servers.ts`
+  - `src/pages/ServerMonitoringPage.tsx`
+  - `src/pages/MetricsPage.tsx`
+- **Suggested minimal fix:**
+  - Сопоставлять `ringPoints` и `dbRows` строго по попаданию их `timestamp` в интервал `[tsSec - stepSeconds/2, tsSec + stepSeconds/2]`, пробрасывать `AbortSignal` из TanStack Query в `fetchServerMonitoring`, не размонтировать панель диапазонов во время подгрузки и отображать дату+время на оси X для `24h` и `7d`.
+- **Status:** FIXED (добавлен регрессионный тест в `tests/monitoring.test.ts`).
+
+---
+
 ## Проблемы, требующие отдельной архитектурной задачи (Не изменялись на этапе SAFE DEBUG / QA)
 
 1. **Прямой HTTP Push от агента в закрытом окружении AI Studio Preview**:

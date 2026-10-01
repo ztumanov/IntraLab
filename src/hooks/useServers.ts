@@ -33,6 +33,7 @@ import {
   DockerContainerAction,
   DockerRunContainerInput,
   MonitoringTimeRange,
+  Server,
   SystemLogSource,
   UpdateCredentialsInput,
 } from '../types/server.ts';
@@ -83,7 +84,7 @@ export function useServerMonitoring(
 ) {
   return useQuery({
     queryKey: ['servers', id, 'monitoring', range],
-    queryFn: () => fetchServerMonitoring(id, range),
+    queryFn: ({ signal }) => fetchServerMonitoring(id, range, signal),
     enabled: Number.isInteger(id) && id > 0,
     refetchInterval: autoRefreshMs,
   });
@@ -105,8 +106,8 @@ export function useInstallServerAgentViaSsh() {
     mutationFn: (id: number) => installServerAgentViaSsh(id),
     onSuccess: (updated, id) => {
       queryClient.setQueryData(['servers', id, 'agent'], updated);
-      queryClient.invalidateQueries({ queryKey: ['servers', id] });
-      queryClient.invalidateQueries({ queryKey: ['servers'] });
+      queryClient.invalidateQueries({ queryKey: ['servers', id], exact: true });
+      queryClient.invalidateQueries({ queryKey: ['servers'], exact: true });
       queryClient.invalidateQueries({ queryKey: ['servers', id, 'monitoring'] });
     },
   });
@@ -127,10 +128,14 @@ export function useServerTelemetry(id: number, autoRefreshMs: number | false = f
   const queryClient = useQueryClient();
   return useQuery({
     queryKey: ['servers', id, 'telemetry'],
-    queryFn: async () => {
-      const data = await fetchServerTelemetry(id);
+    queryFn: async ({ signal }) => {
+      const data = await fetchServerTelemetry(id, signal);
       queryClient.setQueryData(['servers', id], data.server);
-      queryClient.invalidateQueries({ queryKey: ['servers'] });
+      queryClient.setQueryData<Server[]>(['servers'], (prev) =>
+        Array.isArray(prev)
+          ? prev.map((srv) => (srv.id === data.server.id ? data.server : srv))
+          : prev
+      );
       return data;
     },
     enabled: Number.isInteger(id) && id > 0,
