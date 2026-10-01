@@ -1630,58 +1630,85 @@ export function createApp() {
       const isPassiveQuery = req.query.passive === 'true';
 
       if (
-        !isPassiveQuery &&
         agentView.agent_id &&
         agentView.version !== 'stopped' &&
-        lastSeenAgeMs > 25000 &&
-        server.encryptedSecret
+        lastSeenAgeMs > 25000
       ) {
+        let refreshedViaHttp = false;
         try {
-          const checkExec = await executeSshCommand({
-            ipAddress: server.ipAddress,
-            sshPort: server.sshPort,
-            username: server.username,
-            authType: server.authType === 'private_key' ? 'private_key' : 'password',
-            encryptedSecret: server.encryptedSecret,
-            command: [
-              'if ! curl -fsS --max-time 2 http://127.0.0.1:9101/metrics >/dev/null 2>&1; then',
-              '  if [ -x /usr/local/bin/infralab-agent ]; then',
-              '    nohup /usr/local/bin/infralab-agent run >/var/log/infralab-agent.log 2>&1 &',
-              '    sleep 1',
-              '  fi',
-              'fi',
-              'if [ -x /usr/local/bin/infralab-agent ] || curl -fsS --max-time 2 http://127.0.0.1:9101/metrics >/dev/null 2>&1; then',
-              '  H=$(hostname 2>/dev/null || echo linux-host)',
-              '  OS=$( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -s )',
-              '  KERN=$(uname -r 2>/dev/null || echo Linux)',
-              '  ARCH=$(uname -m 2>/dev/null || echo x86_64)',
-              '  CPU=$(nproc 2>/dev/null || echo 1)',
-              "  RAM=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0)",
-              "  UP=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)",
-              '  echo "INFRALAB_ALIVE|$H|$OS|$KERN|$ARCH|$CPU|$RAM|$UP"',
-              'fi',
-            ].join('\n'),
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 1400);
+          const metricsResp = await fetch(`http://${server.ipAddress}:9101/metrics`, {
+            signal: controller.signal,
           });
-          const aliveLine = (checkExec.stdout || '')
-            .split('\n')
-            .find((l) => l.startsWith('INFRALAB_ALIVE|'));
-          if (aliveLine) {
-            const parts = aliveLine.split('|');
-            await recordAgentSystemInfo({
-              agentId: agentView.agent_id,
-              version: agentView.version || '0.2.0',
-              hostname: parts[1] || server.hostname,
-              osDistribution: parts[2] || server.osInfo || 'Linux',
-              kernel: parts[3] || server.kernelInfo || 'Linux',
-              architecture: parts[4] || 'x86_64',
-              cpuCount: Number(parts[5]) || 1,
-              ramTotalBytes: Number(parts[6]) || 0,
-              uptimeSeconds: Number(parts[7]) || 0,
-            });
-            agentView = await getOrProvisionServerAgent(server.id);
+          clearTimeout(timer);
+          if (metricsResp.ok) {
+            const metricsText = await metricsResp.text();
+            if (metricsText.includes('infralab_')) {
+              const upMatch = metricsText.match(/infralab_uptime_seconds(?:\{[^}]*\})?\s+(\d+)/);
+              const uptimeSec = upMatch ? Number(upMatch[1]) : undefined;
+              await recordAgentHeartbeat({
+                agentId: agentView.agent_id,
+                version: agentView.version || '0.2.0',
+                hostname: agentView.hostname || server.hostname,
+                uptimeSeconds: uptimeSec,
+              });
+              agentView = await getOrProvisionServerAgent(server.id);
+              refreshedViaHttp = true;
+            }
           }
         } catch {
-          // Ignore SSH check errors
+          // Fall back to SSH if direct HTTP :9101 is not reachable
+        }
+
+        if (!refreshedViaHttp && !isPassiveQuery && server.encryptedSecret) {
+          try {
+            const checkExec = await executeSshCommand({
+              ipAddress: server.ipAddress,
+              sshPort: server.sshPort,
+              username: server.username,
+              authType: server.authType === 'private_key' ? 'private_key' : 'password',
+              encryptedSecret: server.encryptedSecret,
+              command: [
+                'if ! curl -fsS --max-time 2 http://127.0.0.1:9101/metrics >/dev/null 2>&1; then',
+                '  if [ -x /usr/local/bin/infralab-agent ]; then',
+                '    nohup /usr/local/bin/infralab-agent run >/var/log/infralab-agent.log 2>&1 &',
+                '    sleep 1',
+                '  fi',
+                'fi',
+                'if [ -x /usr/local/bin/infralab-agent ] || curl -fsS --max-time 2 http://127.0.0.1:9101/metrics >/dev/null 2>&1; then',
+                '  H=$(hostname 2>/dev/null || echo linux-host)',
+                '  OS=$( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -s )',
+                '  KERN=$(uname -r 2>/dev/null || echo Linux)',
+                '  ARCH=$(uname -m 2>/dev/null || echo x86_64)',
+                '  CPU=$(nproc 2>/dev/null || echo 1)',
+                "  RAM=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0)",
+                "  UP=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)",
+                '  echo "INFRALAB_ALIVE|$H|$OS|$KERN|$ARCH|$CPU|$RAM|$UP"',
+                'fi',
+              ].join('\n'),
+            });
+            const aliveLine = (checkExec.stdout || '')
+              .split('\n')
+              .find((l) => l.startsWith('INFRALAB_ALIVE|'));
+            if (aliveLine) {
+              const parts = aliveLine.split('|');
+              await recordAgentSystemInfo({
+                agentId: agentView.agent_id,
+                version: agentView.version || '0.2.0',
+                hostname: parts[1] || server.hostname,
+                osDistribution: parts[2] || server.osInfo || 'Linux',
+                kernel: parts[3] || server.kernelInfo || 'Linux',
+                architecture: parts[4] || 'x86_64',
+                cpuCount: Number(parts[5]) || 1,
+                ramTotalBytes: Number(parts[6]) || 0,
+                uptimeSeconds: Number(parts[7]) || 0,
+              });
+              agentView = await getOrProvisionServerAgent(server.id);
+            }
+          } catch {
+            // Ignore SSH check errors
+          }
         }
       }
 
@@ -2204,6 +2231,19 @@ WantedBy=multi-user.target
     }
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     return res.sendFile(unitPath);
+  });
+
+  app.get('/downloads/infralab-qa-report.md', (_req, res) => {
+    const reportPath = path.join(process.cwd(), 'docs', 'final-qa-report.md');
+    if (!fs.existsSync(reportPath)) {
+      return res.status(404).send('QA report not found');
+    }
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="infralab-qa-report.md"'
+    );
+    return res.sendFile(reportPath);
   });
 
   return app;

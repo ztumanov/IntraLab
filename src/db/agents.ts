@@ -245,17 +245,18 @@ export async function provisionAgentDirectlyForServer(params: {
   agentId: string;
   credential: string;
 }> {
-  const newAgentId = generateAgentId();
+  const existing = await db
+    .select()
+    .from(agents)
+    .where(eq(agents.serverId, params.serverId));
+
+  const existingAgentId = existing[0]?.agentId?.trim();
+  const newAgentId = existingAgentId ? existingAgentId : generateAgentId();
   const plainCredential = generateAgentCredential();
   const credHash = sha256Hex(plainCredential);
   const now = new Date();
   const version = (params.version || '0.2.0').trim();
   const hostname = (params.hostname || '').trim();
-
-  const existing = await db
-    .select()
-    .from(agents)
-    .where(eq(agents.serverId, params.serverId));
 
   if (existing.length === 0) {
     await db.insert(agents).values({
@@ -284,6 +285,16 @@ export async function provisionAgentDirectlyForServer(params: {
       })
       .where(eq(agents.serverId, params.serverId));
   }
+
+  await db
+    .update(servers)
+    .set({
+      status: 'online',
+      lastCheckError: '',
+      lastCheckedAt: now,
+      updatedAt: now,
+    })
+    .where(eq(servers.id, params.serverId));
 
   return {
     agentId: newAgentId,
@@ -325,6 +336,7 @@ export async function recordAgentHeartbeat(params: {
   agentId: string;
   version?: string;
   hostname?: string;
+  uptimeSeconds?: number;
 }): Promise<Date> {
   const now = new Date();
   const currentRows = await db
@@ -344,6 +356,9 @@ export async function recordAgentHeartbeat(params: {
   }
   if (params.hostname && params.hostname.trim()) {
     updateSet.hostname = params.hostname.trim();
+  }
+  if (typeof params.uptimeSeconds === 'number' && params.uptimeSeconds > 0) {
+    updateSet.uptimeSeconds = Math.round(params.uptimeSeconds);
   }
 
   const updated = await db

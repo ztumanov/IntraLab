@@ -853,7 +853,11 @@ export const ServerDetailsPage: React.FC = () => {
               <div>
                 <p className="text-xs font-medium text-slate-400">Version</p>
                 <p className="mt-1.5 font-mono text-sm font-medium text-slate-100 tabular-nums">
-                  {agentInfo?.version ? `v${agentInfo.version.replace(/^v/, '')}` : '—'}
+                  {agentInfo?.version
+                    ? agentInfo.version === 'stopped'
+                      ? 'stopped'
+                      : `v${agentInfo.version.replace(/^v/, '')}`
+                    : '—'}
                 </p>
               </div>
 

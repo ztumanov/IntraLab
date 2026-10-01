@@ -133,6 +133,31 @@
 
 ---
 
+## BUG-007
+
+- **Component:** Prometheus Exporter Scraping & Agent Heartbeat Synchronization (`src/server/prometheusClient.ts`, `src/db/agents.ts`, `server.ts`)
+- **Severity:** HIGH
+- **How to reproduce:**
+  1. На сервере (`server#2`, `144.31.192.206`) запущен `infralab-agent`, отдающий метрики по прямому HTTP `http://144.31.192.206:9101/metrics` (`200 OK`).
+  2. Вызвать `GET /api/servers/2/metrics` или `GET /api/servers/2/agent?passive=true` или выполнить `make check`.
+- **Expected:**
+  - При успешном прямом HTTP-опросе `http://<ip>:9101/metrics` для активного (не остановленного) агента поле `last_seen_at` и `uptime_seconds` в таблице `agents` должны обновляться, поддерживая статус агента `ONLINE` и не перезаписывая `cpu_count` фиктивным значением.
+  - При перезапуске остановленного агента по SSH (`provisionAgentDirectlyForServer`) его существующий `agent_id` (`agt_...`) должен сохраняться.
+- **Actual:**
+  - В `scrapeLiveHostPrometheusExporter()` ветка прямого HTTP-опроса `:9101/metrics` возвращала результат без вызова `recordAgentHeartbeat()`, тогда как обновление БД выполнялось только в резервной SSH-ветке (которая не вызывалась при доступном порте 9101 и при этом перезаписывала `cpuCount: 2`). В результате живой агент на `server#2` отображался в БД и `make check` как `OFFLINE`.
+- **Root cause:**
+  - Отсутствие вызова `recordAgentHeartbeat()` при успешном прямом HTTP-скрапинге `:9101/metrics` в `src/server/prometheusClient.ts` и `GET /api/servers/:id/agent` в `server.ts`.
+- **Affected files:**
+  - `src/server/prometheusClient.ts`
+  - `src/db/agents.ts`
+  - `server.ts`
+  - `tests/agent.test.ts`
+- **Suggested minimal fix:**
+  - Вызывать `recordAgentHeartbeat` при успешном скрапинге `:9101/metrics` (как по прямому HTTP, так и через SSH fallback), проверять `:9101/metrics` в `GET /api/servers/:id/agent` и сохранять существующий `agent_id` при перезапуске агента в `provisionAgentDirectlyForServer`.
+- **Status:** FIXED (добавлен регрессионный тест в `tests/agent.test.ts`).
+
+---
+
 ## Проблемы, требующие отдельной архитектурной задачи (Не изменялись на этапе SAFE DEBUG / QA)
 
 1. **Прямой HTTP Push от агента в закрытом окружении AI Studio Preview**:

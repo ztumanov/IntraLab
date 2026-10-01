@@ -108,6 +108,8 @@ export const ContainersPage: React.FC = () => {
     data: dockerData,
     isLoading: isLoadingDocker,
     isFetching: isFetchingDocker,
+    isError: isDockerError,
+    error: dockerError,
     refetch: refetchDocker,
   } = useServerDocker(selectedServer?.id || 0, autoPoll ? 15000 : false);
 
@@ -450,10 +452,14 @@ export const ContainersPage: React.FC = () => {
           </div>
         )}
 
-        {dockerData?.error && (
+        {(dockerData?.error || isDockerError) && (
           <div className="mt-3 flex items-center gap-2 rounded border border-rose-500/40 bg-rose-950/30 px-3.5 py-2.5 text-xs text-rose-200">
             <AlertCircle className="h-4 w-4 text-rose-400 shrink-0" />
-            <span>{dockerData.error}</span>
+            <span>
+              {dockerData?.error ||
+                (dockerError as Error)?.message ||
+                t('Ошибка запроса к Docker API', 'Failed to inspect Docker on host')}
+            </span>
           </div>
         )}
       </section>

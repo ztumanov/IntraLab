@@ -9,6 +9,7 @@ import {
   enrollAgentWithToken,
   getOrProvisionServerAgent,
   listPrometheusAgentTargets,
+  provisionAgentDirectlyForServer,
   recordAgentHeartbeat,
   recordAgentSystemInfo,
   rotateServerEnrollmentToken,
@@ -210,7 +211,7 @@ test('Linux Agent lifecycle, Prometheus HTTP Service Discovery, and PromQL range
       assert.ok(receivedQueries.includes(expectedQueries.disk));
 
       // 10. Regression test for BUG-001: stopping an agent marks it OFFLINE, excludes it from Prometheus SD,
-      // and prevents stray heartbeats from reviving it back to ONLINE.
+      // and prevents stray heartbeats or system-info payloads from reviving it back to ONLINE.
       const stoppedView = await stopServerAgent(server.id);
       assert.equal(stoppedView.status, 'OFFLINE');
       assert.equal(stoppedView.version, 'stopped');
@@ -234,6 +235,48 @@ test('Linux Agent lifecycle, Prometheus HTTP Service Discovery, and PromQL range
       const afterLateHeartbeat = await getOrProvisionServerAgent(server.id);
       assert.equal(afterLateHeartbeat.status, 'OFFLINE');
       assert.equal(afterLateHeartbeat.version, 'stopped');
+
+      // Late system-info after stop must ALSO not revive the stopped agent
+      await recordAgentSystemInfo({
+        agentId: enrollResult.agentId,
+        hostname: 'prod-linux-01',
+        osDistribution: 'Ubuntu 24.04.1 LTS',
+        kernel: '6.8.0-45-generic',
+        architecture: 'amd64',
+        cpuCount: 8,
+        ramTotalBytes: 17179869184,
+        uptimeSeconds: 86500,
+      });
+      const afterLateSysInfo = await getOrProvisionServerAgent(server.id);
+      assert.equal(afterLateSysInfo.status, 'OFFLINE');
+      assert.equal(afterLateSysInfo.version, 'stopped');
+
+      // 11. Agent restart -> reconnect -> ONLINE -> Prometheus target reappears
+      const restarted = await provisionAgentDirectlyForServer({
+        serverId: server.id,
+        hostname: 'prod-linux-01',
+        version: '0.2.0',
+      });
+      assert.equal(
+        restarted.agentId,
+        enrollResult.agentId,
+        'Restarted agent must preserve its existing agent_id identity'
+      );
+
+      const afterRestartView = await getOrProvisionServerAgent(server.id);
+      assert.equal(afterRestartView.status, 'ONLINE');
+      assert.equal(afterRestartView.version, '0.2.0');
+      assert.ok(afterRestartView.last_seen_at, 'last_seen_at must be restored after restart');
+
+      const targetsAfterRestart = await listPrometheusAgentTargets(9101);
+      const recoveredTarget = targetsAfterRestart.find(
+        (t) => t.labels.server_id === String(server.id)
+      );
+      assert.ok(
+        recoveredTarget,
+        'Restarted agent must reappear in Prometheus HTTP SD target list'
+      );
+      assert.equal(recoveredTarget.labels.agent_id, enrollResult.agentId);
     } finally {
       await new Promise<void>((resolve) => mockPromServer.close(() => resolve()));
     }

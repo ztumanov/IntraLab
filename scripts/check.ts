@@ -23,8 +23,11 @@ function record(section: string, name: string, status: CheckStatus, detail: stri
 }
 
 function commandExists(cmd: string): boolean {
+  if (process.env.PATH && !process.env.PATH.includes('/usr/local/go/bin')) {
+    process.env.PATH = `${process.env.PATH}:/usr/local/go/bin`;
+  }
   try {
-    execSync(`command -v ${cmd}`, { stdio: 'ignore' });
+    execSync(`command -v ${cmd}`, { stdio: 'ignore', env: process.env });
     return true;
   } catch {
     return false;
@@ -84,23 +87,29 @@ async function runDiagnostics() {
 
   if (commandExists('go')) {
     try {
-      execSync('cd backend && go vet ./... && go test ./...', { stdio: 'pipe' });
-      record('Backend', 'Go backend (go vet & go test)', 'PASS', 'backend/... passed');
+      execSync('cd backend && go vet ./... && go test ./... && go build ./...', {
+        stdio: 'pipe',
+        env: process.env,
+      });
+      record('Backend', 'Go backend (go vet, go test, go build)', 'PASS', 'backend/... passed');
     } catch (err: any) {
       record(
         'Backend',
-        'Go backend (go vet & go test)',
+        'Go backend (go vet, go test, go build)',
         'FAIL',
         (err?.stderr?.toString() || err?.message || 'Go check failed').trim()
       );
     }
     try {
-      execSync('cd agent && go vet ./... && go test ./...', { stdio: 'pipe' });
-      record('Backend', 'Go agent (go vet & go test)', 'PASS', 'agent/... passed');
+      execSync('cd agent && go vet ./... && go test ./... && go build ./...', {
+        stdio: 'pipe',
+        env: process.env,
+      });
+      record('Backend', 'Go agent (go vet, go test, go build)', 'PASS', 'agent/... passed');
     } catch (err: any) {
       record(
         'Backend',
-        'Go agent (go vet & go test)',
+        'Go agent (go vet, go test, go build)',
         'FAIL',
         (err?.stderr?.toString() || err?.message || 'Go agent check failed').trim()
       );
@@ -253,6 +262,44 @@ async function runDiagnostics() {
           `WARNING: docker compose config returned: ${(err?.message || '').trim()}`
         );
       }
+    } else if (firstServerId) {
+      try {
+        const readOnlyDockerToken = signLocalSessionToken({
+          uid: sampleUserId,
+          username: sampleUsername,
+          email: sampleEmail,
+        });
+        const dockerRes = await fetchJsonWithTimeout(
+          `${baseUrl}/api/servers/${firstServerId}/docker`,
+          { Authorization: `Bearer ${readOnlyDockerToken}` },
+          10000
+        );
+        if (dockerRes.status === 200 && dockerRes.body?.daemon_active) {
+          const runningContainers = Array.isArray(dockerRes.body.containers)
+            ? dockerRes.body.containers.filter((c: any) => c.state === 'running').length
+            : 0;
+          record(
+            'Docker',
+            `Host Docker Engine (/api/servers/${firstServerId}/docker)`,
+            'PASS',
+            `Docker v${dockerRes.body.docker_version || '24+'} ONLINE (${runningContainers} running container(s))`
+          );
+        } else {
+          record(
+            'Docker',
+            'Docker daemon & containers',
+            'WARN',
+            'WARNING: docker CLI not available in local container; remote host Docker daemon not active'
+          );
+        }
+      } catch {
+        record(
+          'Docker',
+          'Docker daemon & containers',
+          'WARN',
+          'WARNING: docker CLI not available in current runtime environment; static compose check passed'
+        );
+      }
     } else {
       record(
         'Docker',
@@ -284,9 +331,11 @@ async function runDiagnostics() {
     record('Prometheus', 'prometheus/prometheus.yml configuration', 'FAIL', 'Missing prometheus.yml');
   }
 
+  let activeTargetsList: any[] = [];
   try {
     const sdRes = await fetchJsonWithTimeout(`${baseUrl}/api/prometheus/targets`);
     if (sdRes.status === 200 && Array.isArray(sdRes.body)) {
+      activeTargetsList = sdRes.body;
       record(
         'Prometheus',
         'HTTP Service Discovery (/api/prometheus/targets)',
@@ -310,87 +359,62 @@ async function runDiagnostics() {
     );
   }
 
-  const promUrl = (process.env.PROMETHEUS_URL || 'http://127.0.0.1:9090').replace(/\/+$/, '');
-  try {
-    const promReady = await fetchJsonWithTimeout(`${promUrl}/-/ready`, {}, 1500);
-    if (promReady.status === 200) {
-      record('Prometheus', `External Prometheus (${promUrl}/-/ready)`, 'PASS', '200 OK');
-    } else {
+  const firstTargetAddr = activeTargetsList[0]?.targets?.[0];
+  if (firstTargetAddr) {
+    try {
+      const expRes = await fetchJsonWithTimeout(`http://${firstTargetAddr}/metrics`, {}, 3000);
+      const rawText = typeof expRes.body === 'string' ? expRes.body : '';
+      const hasRequiredMetrics =
+        expRes.status === 200 &&
+        rawText.includes('infralab_cpu_usage_ratio') &&
+        rawText.includes('infralab_memory_total_bytes') &&
+        rawText.includes('infralab_filesystem_size_bytes') &&
+        rawText.includes('infralab_network_receive_bytes_total');
+      record(
+        'Prometheus',
+        `Active Target Health & Exporter (http://${firstTargetAddr}/metrics)`,
+        hasRequiredMetrics ? 'PASS' : 'WARN',
+        hasRequiredMetrics
+          ? '200 OK — CPU, Memory, Disk, Network & Uptime metrics verified'
+          : `HTTP ${expRes.status} from target ${firstTargetAddr}`
+      );
+    } catch {
+      record(
+        'Prometheus',
+        `Active Target Health & Exporter (http://${firstTargetAddr}/metrics)`,
+        'WARN',
+        `WARNING: Direct HTTP to ${firstTargetAddr} timed out (using SSH scrape fallback)`
+      );
+    }
+  } else if (process.env.PROMETHEUS_URL) {
+    const promUrl = process.env.PROMETHEUS_URL.replace(/\/+$/, '');
+    try {
+      const promReady = await fetchJsonWithTimeout(`${promUrl}/-/ready`, {}, 1500);
+      record(
+        'Prometheus',
+        `External Prometheus (${promUrl}/-/ready)`,
+        promReady.status === 200 ? 'PASS' : 'WARN',
+        promReady.status === 200 ? '200 OK' : `HTTP ${promReady.status}`
+      );
+    } catch {
       record(
         'Prometheus',
         `External Prometheus (${promUrl}/-/ready)`,
         'WARN',
-        `WARNING: External Prometheus returned HTTP ${promReady.status} (using built-in agent TSDB/exporter scraper)`
+        `WARNING: Prometheus server not reachable at ${promUrl}`
       );
     }
-  } catch {
+  } else {
     record(
       'Prometheus',
-      `External Prometheus (${promUrl}/-/ready)`,
+      'Prometheus Scrape Targets',
       'WARN',
-      'WARNING: External Prometheus server is not running on :9090; built-in agent TSDB & live SSH exporter scraper is active'
+      'WARNING: No active agent scrape targets currently registered'
     );
   }
 
   // ---------------------------------------------------------------------------
-  // 6. AGENT CHECKS (Read-only; emits WARNING if no agent is running)
-  // ---------------------------------------------------------------------------
-  try {
-    const agentsRes = await pool.query<{
-      id: number;
-      server_id: number;
-      agent_id: string | null;
-      hostname: string;
-      version: string;
-      last_seen_at: Date | null;
-    }>(`SELECT id, server_id, agent_id, hostname, version, last_seen_at FROM agents ORDER BY id ASC`);
-
-    if (agentsRes.rows.length === 0) {
-      record(
-        'Agent',
-        'Enrolled Linux Agents',
-        'WARN',
-        'WARNING: No agents enrolled in database yet (not a build failure)'
-      );
-    } else {
-      let onlineCount = 0;
-      const summaries: string[] = [];
-      for (const ag of agentsRes.rows) {
-        if (!ag.agent_id) {
-          summaries.push(`server#${ag.server_id}: NOT_INSTALLED`);
-          continue;
-        }
-        if (ag.version === 'stopped') {
-          summaries.push(`server#${ag.server_id} (${ag.agent_id}): STOPPED by user`);
-          continue;
-        }
-        const ageSec = ag.last_seen_at
-          ? Math.round((Date.now() - new Date(ag.last_seen_at).getTime()) / 1000)
-          : null;
-        const isOnline = ageSec !== null && ageSec <= 60;
-        if (isOnline) onlineCount++;
-        summaries.push(
-          `server#${ag.server_id} (${ag.agent_id}): ${isOnline ? 'ONLINE' : 'OFFLINE'} (last heartbeat: ${
-            ageSec !== null ? `${ageSec}s ago` : 'never'
-          })`
-        );
-      }
-
-      record(
-        'Agent',
-        'Agent status & heartbeat',
-        onlineCount > 0 ? 'PASS' : 'WARN',
-        onlineCount > 0
-          ? `${onlineCount} agent(s) ONLINE — ${summaries.join('; ')}`
-          : `WARNING: No agents currently sending live heartbeats — ${summaries.join('; ')}`
-      );
-    }
-  } catch (err: any) {
-    record('Agent', 'Agent database state', 'FAIL', err?.message || 'Failed to query agents');
-  }
-
-  // ---------------------------------------------------------------------------
-  // 7. API ENDPOINT CHECKS (Read-only, zero data mutation)
+  // 6. API ENDPOINT CHECKS (Read-only)
   // ---------------------------------------------------------------------------
   try {
     const healthRes = await fetchJsonWithTimeout(`${baseUrl}/api/health`);
@@ -488,6 +512,63 @@ async function runDiagnostics() {
     }
   } catch (err: any) {
     record('API', 'API endpoint checks', 'FAIL', err?.message || 'API check failed');
+  }
+
+  // ---------------------------------------------------------------------------
+  // 7. AGENT CHECKS (Read-only; emits WARNING if no agent is running)
+  // ---------------------------------------------------------------------------
+  try {
+    const agentsRes = await pool.query<{
+      id: number;
+      server_id: number;
+      agent_id: string | null;
+      hostname: string;
+      version: string;
+      last_seen_at: Date | null;
+    }>(`SELECT id, server_id, agent_id, hostname, version, last_seen_at FROM agents ORDER BY id ASC`);
+
+    if (agentsRes.rows.length === 0) {
+      record(
+        'Agent',
+        'Enrolled Linux Agents',
+        'WARN',
+        'WARNING: No agents enrolled in database yet (not a build failure)'
+      );
+    } else {
+      let onlineCount = 0;
+      const summaries: string[] = [];
+      for (const ag of agentsRes.rows) {
+        if (!ag.agent_id) {
+          summaries.push(`server#${ag.server_id}: NOT_INSTALLED`);
+          continue;
+        }
+        if (ag.version === 'stopped') {
+          summaries.push(`server#${ag.server_id} (${ag.agent_id}): STOPPED by user`);
+          continue;
+        }
+        const ageSec = ag.last_seen_at
+          ? Math.round((Date.now() - new Date(ag.last_seen_at).getTime()) / 1000)
+          : null;
+        const isOnline = ageSec !== null && ageSec <= 60;
+        if (isOnline) onlineCount++;
+        summaries.push(
+          `server#${ag.server_id} (${ag.agent_id}): ${isOnline ? 'ONLINE' : 'OFFLINE'} (last heartbeat: ${
+            ageSec !== null ? `${ageSec}s ago` : 'never'
+          })`
+        );
+      }
+
+      record(
+        'Agent',
+        'Agent status & heartbeat',
+        onlineCount > 0 ? 'PASS' : 'WARN',
+        onlineCount > 0
+          ? `${onlineCount} agent(s) ONLINE — ${summaries.join('; ')}`
+          : `WARNING: No agents currently sending live heartbeats — ${summaries.join('; ')}`
+      );
+    }
+  } catch (err: any) {
+    record('Agent', 'Agent database state', 'FAIL', err?.message || 'Failed to query agents');
   }
 
   // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 import { listServerMetrics } from '../db/servers.ts';
 import {
   getOrProvisionServerAgent,
-  recordAgentSystemInfo,
+  recordAgentHeartbeat,
 } from '../db/agents.ts';
 import { executeSshCommand } from './sshConnector.ts';
 import type {
@@ -359,6 +359,14 @@ async function scrapeLiveHostPrometheusExporter(server: {
       );
       if (parsed) {
         lastExporterScrapeByServer.set(server.id, parsed);
+        if (agentId) {
+          await recordAgentHeartbeat({
+            agentId,
+            version: '0.2.0',
+            hostname: server.hostname,
+            uptimeSeconds: parsed.uptimeSeconds,
+          }).catch(() => {});
+        }
         return parsed;
       }
     }
@@ -403,15 +411,10 @@ async function scrapeLiveHostPrometheusExporter(server: {
 
           // Keep agent heartbeat fresh whenever Prometheus metrics are scraped
           if (agentId) {
-            await recordAgentSystemInfo({
+            await recordAgentHeartbeat({
               agentId,
               version: '0.2.0',
               hostname: server.hostname,
-              osDistribution: server.osInfo || 'Linux',
-              kernel: server.kernelInfo || 'Linux',
-              architecture: 'x86_64',
-              cpuCount: 2,
-              ramTotalBytes: parsed.memoryTotalMb * 1024 * 1024,
               uptimeSeconds: parsed.uptimeSeconds,
             }).catch(() => {});
           }

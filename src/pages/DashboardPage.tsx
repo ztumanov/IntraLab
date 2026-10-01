@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useOutletContext } from 'react-router-dom';
-import { Plus, ArrowRight, RefreshCw, Activity, Globe } from 'lucide-react';
+import { Plus, ArrowRight, RefreshCw, Activity, Globe, Download } from 'lucide-react';
 import {
   useCheckAllServers,
   useServers,
@@ -75,6 +75,15 @@ export const DashboardPage: React.FC = () => {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2.5 self-start sm:self-auto">
+          <a
+            href="/downloads/infralab-qa-report.md"
+            download="infralab-qa-report.md"
+            className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#1E293B] px-3.5 py-2 text-xs font-semibold text-slate-200 transition-colors hover:bg-slate-800 whitespace-nowrap"
+          >
+            <Download className="h-3.5 w-3.5 text-emerald-400" />
+            <span>{t('Скачать QA-отчёт (.md)', 'Download QA Report (.md)')}</span>
+          </a>
+
           <Link
             to="/map"
             className="inline-flex items-center gap-1.5 rounded-md border border-sky-500/40 bg-sky-500/10 px-3.5 py-2 text-xs font-semibold text-sky-300 transition-colors hover:bg-sky-500/20 whitespace-nowrap"

@@ -103,6 +103,8 @@ export const LogsPage: React.FC = () => {
     data: logsData,
     isLoading: isLoadingLogs,
     isFetching: isFetchingLogs,
+    isError: isLogsError,
+    error: logsError,
     refetch: refetchLogs,
   } = useServerSystemLogs(
     selectedServer?.id || 0,
@@ -114,6 +116,8 @@ export const LogsPage: React.FC = () => {
   const {
     data: auditLogs = [],
     isLoading: isLoadingAudit,
+    isError: isAuditError,
+    error: auditError,
     refetch: refetchAudit,
   } = useServerCommandLogs(selectedServer?.id || 0);
 
@@ -575,6 +579,14 @@ export const LogsPage: React.FC = () => {
                     />
                   ))}
                 </div>
+              ) : isLogsError ? (
+                <div className="p-6 font-mono text-xs text-rose-300 bg-rose-950/20">
+                  {(logsError as Error)?.message ||
+                    t(
+                      'Ошибка получения системных логов по SSH.',
+                      'Failed to fetch system logs over SSH.'
+                    )}
+                </div>
               ) : filteredLines.length === 0 ? (
                 <div className="p-8 text-center font-mono text-xs text-slate-500">
                   {t(
@@ -644,7 +656,15 @@ export const LogsPage: React.FC = () => {
         {/* SSH COMMAND AUDIT LOG TAB */}
         {activeTab === 'audit' && (
           <div className="space-y-3">
-            {auditLogs.length === 0 ? (
+            {isAuditError ? (
+              <div className="rounded-lg border border-rose-500/40 bg-rose-950/30 p-4 text-xs text-rose-200">
+                {(auditError as Error)?.message ||
+                  t(
+                    'Ошибка загрузки журнала аудита SSH-команд.',
+                    'Failed to load SSH command audit log.'
+                  )}
+              </div>
+            ) : auditLogs.length === 0 ? (
               <div className="rounded-lg border border-slate-800 bg-[#0F172A] p-8 text-center text-xs text-slate-400">
                 {t(
                   'Для этого сервера пока нет записей в журнале аудита SSH-команд.',

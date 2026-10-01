@@ -89,6 +89,8 @@ export const MetricsPage: React.FC = () => {
   const {
     data: liveTelemetry,
     isFetching: isFetchingTelemetry,
+    isError: isTelemetryError,
+    error: telemetryError,
     refetch: refetchTelemetry,
   } = useServerTelemetry(selectedServer?.id || 0, autoPoll ? 10000 : false);
 
@@ -99,6 +101,8 @@ export const MetricsPage: React.FC = () => {
   const {
     data: monitoring,
     isFetching: isFetchingMonitoring,
+    isError: isMonitoringError,
+    error: monitoringError,
     refetch: refetchMonitoring,
   } = useServerMonitoring(
     selectedServer?.id || 0,
@@ -392,6 +396,16 @@ export const MetricsPage: React.FC = () => {
               <KeyRound className="h-3.5 w-3.5" />
               <span>{t('Настроить SSH-доступ →', 'Configure SSH Credentials →')}</span>
             </Link>
+          </div>
+        )}
+
+        {(isMonitoringError || isTelemetryError) && (
+          <div className="mt-3 flex items-center gap-2 rounded border border-rose-500/40 bg-rose-950/30 px-3.5 py-2.5 text-xs text-rose-200">
+            <AlertCircle className="h-4 w-4 text-rose-400 shrink-0" />
+            <span>
+              {((monitoringError || telemetryError) as Error)?.message ||
+                t('Ошибка получения метрик сервера', 'Failed to fetch server metrics')}
+            </span>
           </div>
         )}
       </section>
