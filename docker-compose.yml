@@ -62,9 +62,14 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@infralab.local}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-InfraLab!2026}
       OPERATOR_EMAIL: ${OPERATOR_EMAIL:-admin@infralab.local}
+      AGENT_CERT_TTL_HOURS: ${AGENT_CERT_TTL_HOURS:-72}
+      AGENT_PKI_DIR: /var/lib/infralab/pki
+    volumes:
+      - infralab_pki:/var/lib/infralab/pki
     ports:
       - "${APP_PORT:-3000}:3000"
 
 volumes:
   postgres_data:
   prometheus_data:
+  infralab_pki:

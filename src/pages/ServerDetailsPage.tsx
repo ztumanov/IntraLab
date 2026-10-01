@@ -25,6 +25,7 @@ import {
   useDeleteServer,
   useExecuteSshCommand,
   useInstallServerAgentViaSsh,
+  useRevokeServerAgentCert,
   useRotateServerAgentToken,
   useServer,
   useServerAgent,
@@ -71,6 +72,7 @@ export const ServerDetailsPage: React.FC = () => {
   const credentialsMutation = useUpdateServerCredentials();
   const execMutation = useExecuteSshCommand();
   const rotateTokenMutation = useRotateServerAgentToken();
+  const revokeCertMutation = useRevokeServerAgentCert();
   const installAgentSshMutation = useInstallServerAgentViaSsh();
   const stopAgentSshMutation = useStopServerAgentViaSsh();
   const { t } = useI18n();
@@ -799,7 +801,40 @@ export const ServerDetailsPage: React.FC = () => {
                   : t('Перевыпустить токен enrollment', 'Re-issue Enrollment Token')}
               </button>
             )}
-            <span className="font-mono text-xs text-slate-400">HTTPS · 15s Heartbeat</span>
+            {agentInfo &&
+              agentInfo.cert_serial &&
+              !agentInfo.cert_revoked_at && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setAgentInstallMsg(null);
+                    setAgentInstallErr(null);
+                    try {
+                      await revokeCertMutation.mutateAsync(server.id);
+                      setAgentInstallMsg(
+                        t(
+                          'Сертификат X.509 агента отозван. Доступ по старому mTLS-сертификату заблокирован.',
+                          'Agent X.509 certificate revoked. Access with the old mTLS certificate is blocked.'
+                        )
+                      );
+                    } catch (err: any) {
+                      setAgentInstallErr(
+                        err?.message ||
+                          t('Не удалось отозвать сертификат', 'Failed to revoke certificate')
+                      );
+                    }
+                  }}
+                  disabled={revokeCertMutation.isPending}
+                  className="rounded border border-amber-500/40 bg-amber-950/30 px-2.5 py-1 font-mono text-xs text-amber-300 transition-colors hover:bg-amber-950/50 disabled:opacity-50"
+                >
+                  {revokeCertMutation.isPending
+                    ? t('Отзыв...', 'Revoking...')
+                    : t('Отозвать X.509 сертификат', 'Revoke X.509 Cert')}
+                </button>
+              )}
+            <span className="font-mono text-xs text-slate-400">
+              {agentInfo?.auth_mode === 'mtls' ? 'mTLS X.509 · 15s Heartbeat' : 'HTTPS · 15s Heartbeat'}
+            </span>
           </div>
         </div>
 
@@ -918,6 +953,61 @@ export const ServerDetailsPage: React.FC = () => {
                   <p className="mt-0.5 font-mono text-slate-200 tabular-nums">
                     {agentInfo.ram_total_bytes > 0
                       ? `${Math.round(agentInfo.ram_total_bytes / (1024 * 1024))} MB`
+                      : '—'}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {agentInfo && agentInfo.agent_id && (
+              <div className="grid grid-cols-1 gap-4 border-t border-slate-800 pt-4 text-xs sm:grid-cols-2 lg:grid-cols-4">
+                <div>
+                  <span className="text-slate-400">Auth Mode:</span>
+                  <p className="mt-0.5 font-mono text-emerald-400">
+                    {agentInfo.cert_revoked_at
+                      ? 'REVOKED (X.509)'
+                      : agentInfo.auth_mode === 'mtls'
+                      ? 'mTLS X.509 (InfraLab CA)'
+                      : 'Bearer (Transitional)'}
+                  </p>
+                </div>
+                <div>
+                  <span className="text-slate-400">SPIFFE Identity (SAN URI):</span>
+                  <p className="mt-0.5 font-mono text-slate-200 break-all">
+                    {agentInfo.cert_san_uri || `spiffe://infralab/agent/${agentInfo.agent_id}`}
+                  </p>
+                </div>
+                <div>
+                  <span className="text-slate-400">Cert Serial / SHA-256:</span>
+                  <p className="mt-0.5 font-mono text-slate-200 truncate" title={agentInfo.cert_fingerprint_sha256 || ''}>
+                    {agentInfo.cert_serial
+                      ? `${agentInfo.cert_serial.slice(0, 12)}… · ${
+                          agentInfo.cert_fingerprint_sha256
+                            ? agentInfo.cert_fingerprint_sha256.slice(0, 12) + '…'
+                            : ''
+                        }`
+                      : '—'}
+                  </p>
+                </div>
+                <div>
+                  <span className="text-slate-400">
+                    {agentInfo.cert_revoked_at ? 'Revoked At:' : 'Cert Expires (NotAfter):'}
+                  </span>
+                  <p
+                    className={`mt-0.5 font-mono tabular-nums ${
+                      agentInfo.cert_revoked_at ? 'text-rose-400' : 'text-slate-200'
+                    }`}
+                  >
+                    {agentInfo.cert_revoked_at
+                      ? `${new Date(agentInfo.cert_revoked_at)
+                          .toISOString()
+                          .replace('T', ' ')
+                          .slice(0, 19)} UTC`
+                      : agentInfo.cert_not_after
+                      ? `${new Date(agentInfo.cert_not_after)
+                          .toISOString()
+                          .replace('T', ' ')
+                          .slice(0, 19)} UTC`
                       : '—'}
                   </p>
                 </div>

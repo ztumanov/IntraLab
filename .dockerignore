@@ -5,3 +5,8 @@ dist
 .gmp_cache
 *.log
 .DS_Store
+*.key
+*.pem
+*.crt
+pki
+

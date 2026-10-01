@@ -13,7 +13,9 @@ import platform
 import shutil
 import socket
 import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -24,6 +26,53 @@ VERSION = "0.2.0"
 DEFAULT_CONFIG_PATH = "/etc/infralab-agent/config.json"
 DEFAULT_CRED_PATH = "/var/lib/infralab-agent/credentials.json"
 DEFAULT_LISTEN_ADDR = ":9101"
+
+
+def write_atomic(path, content, mode=0o600):
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        os.write(fd, data)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, path)
+    os.chmod(path, mode)
+
+
+def generate_local_key_and_csr(common_name="infralab-agent"):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        key_file = os.path.join(tmpdir, "agent.key")
+        csr_file = os.path.join(tmpdir, "agent.csr")
+        subprocess.run(
+            ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key_file],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["openssl", "pkcs8", "-topk8", "-nocrypt", "-in", key_file, "-out", key_file + ".pkcs8"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.replace(key_file + ".pkcs8", key_file)
+        os.chmod(key_file, 0o600)
+        subj = f"/O=InfraLab Agent/CN={common_name}"
+        subprocess.run(
+            ["openssl", "req", "-new", "-sha256", "-key", key_file, "-subj", subj, "-out", csr_file],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with open(key_file, "r", encoding="utf-8") as kf:
+            priv_pem = kf.read()
+        with open(csr_file, "r", encoding="utf-8") as cf:
+            csr_pem = cf.read()
+        return priv_pem, csr_pem
 
 
 def collect_system_info():
@@ -163,13 +212,26 @@ def render_prometheus_metrics(agent_id="local"):
     return "\\n".join(lines)
 
 
-def post_json(url, payload, headers=None):
+def build_ssl_context(ca_cert_path="", client_cert_path="", client_key_path=""):
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    if ca_cert_path and os.path.exists(ca_cert_path):
+        ctx.load_verify_locations(cafile=ca_cert_path)
+    if client_cert_path and client_key_path and os.path.exists(client_cert_path) and os.path.exists(client_key_path):
+        key_mode = os.stat(client_key_path).st_mode & 0o077
+        if key_mode != 0:
+            raise PermissionError(f"private key {client_key_path} has insecure permissions")
+        ctx.load_cert_chain(certfile=client_cert_path, keyfile=client_key_path)
+    return ctx
+
+
+def post_json(url, payload, headers=None, ssl_ctx=None):
     req_headers = {"Content-Type": "application/json", "User-Agent": f"infralab-agent/{VERSION}"}
     if headers:
         req_headers.update(headers)
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
-    ctx = ssl.create_default_context()
+    ctx = ssl_ctx if ssl_ctx is not None else build_ssl_context()
     with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
         if raw.strip().startswith("<"):
@@ -183,18 +245,25 @@ def cmd_enroll(args):
     server_url = args.server.rstrip("/")
     token = args.token.strip()
     info = collect_system_info()
+    priv_pem, csr_pem = generate_local_key_and_csr(info["hostname"])
+    ssl_ctx = build_ssl_context(ca_cert_path=getattr(args, "ca_cert", ""))
     try:
         resp = post_json(
             f"{server_url}/api/agents/enroll",
-            {"token": token, "hostname": info["hostname"], "version": VERSION},
+            {
+                "token": token,
+                "hostname": info["hostname"],
+                "version": VERSION,
+                "csr_pem": csr_pem,
+            },
+            ssl_ctx=ssl_ctx,
         )
         agent_id = resp["agent_id"]
-        credential = resp["credential"]
     except Exception as exc:
         print(f"infralab-agent error: enrollment failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    os.makedirs(os.path.dirname(args.config), exist_ok=True)
+    os.makedirs(os.path.dirname(args.config) or "/etc/infralab-agent", exist_ok=True)
     with open(args.config, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -206,20 +275,44 @@ def cmd_enroll(args):
             indent=2,
         )
 
-    os.makedirs(os.path.dirname(args.credentials), exist_ok=True)
-    with open(args.credentials, "w", encoding="utf-8") as f:
-        json.dump(
+    cred_dir = os.path.dirname(args.credentials) or "/var/lib/infralab-agent"
+    os.makedirs(cred_dir, mode=0o700, exist_ok=True)
+    os.chmod(cred_dir, 0o700)
+
+    client_cert_pem = resp.get("client_cert_pem", "")
+    ca_cert_pem = resp.get("ca_cert_pem", "")
+    cred_payload = {
+        "server_url": server_url,
+        "agent_id": agent_id,
+        "auth_mode": resp.get("auth_mode", "mtls" if client_cert_pem else "bearer"),
+    }
+
+    if client_cert_pem and ca_cert_pem:
+        key_path = os.path.join(cred_dir, "agent.key")
+        cert_path = os.path.join(cred_dir, "agent.crt")
+        ca_path = os.path.join(cred_dir, "ca.crt")
+        write_atomic(key_path, priv_pem, 0o600)
+        write_atomic(cert_path, client_cert_pem, 0o600)
+        write_atomic(ca_path, ca_cert_pem, 0o644)
+        cred_payload.update(
             {
-                "server_url": server_url,
-                "agent_id": agent_id,
-                "credential": credential,
-            },
-            f,
-            indent=2,
+                "auth_mode": "mtls",
+                "client_key_path": key_path,
+                "client_cert_path": cert_path,
+                "ca_cert_path": ca_path,
+                "cert_serial": resp.get("cert_serial", ""),
+                "cert_fingerprint_sha256": resp.get("cert_fingerprint_sha256", ""),
+                "cert_san_uri": resp.get("cert_san_uri", ""),
+                "cert_not_before": resp.get("cert_not_before", ""),
+                "cert_not_after": resp.get("cert_not_after", ""),
+            }
         )
-    os.chmod(args.credentials, 0o600)
+    elif resp.get("credential"):
+        cred_payload["credential"] = resp["credential"]
+
+    write_atomic(args.credentials, json.dumps(cred_payload, indent=2) + "\\n", 0o600)
     print(
-        f"Successfully enrolled agent {agent_id} with {server_url} (credentials stored at {args.credentials} with mode 0600)"
+        f"Successfully enrolled agent {agent_id} with {server_url} (mode={cred_payload['auth_mode']}, credentials stored at {args.credentials} with mode 0600)"
     )
 
 
@@ -227,6 +320,9 @@ def cmd_run(args):
     try:
         with open(args.config, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+        cred_mode = os.stat(args.credentials).st_mode & 0o077
+        if cred_mode != 0:
+            raise PermissionError(f"credentials file {args.credentials} has insecure permissions")
         with open(args.credentials, "r", encoding="utf-8") as f:
             cred = json.load(f)
     except Exception as exc:
@@ -244,6 +340,10 @@ def cmd_run(args):
     agent_id = cred.get("agent_id", "local")
     server_url = cfg.get("server_url", "").rstrip("/")
     credential = cred.get("credential", "")
+    client_cert_path = cred.get("client_cert_path", "")
+    client_key_path = cred.get("client_key_path", "")
+    ca_cert_path = cred.get("ca_cert_path", "")
+    has_mtls = bool(client_cert_path and client_key_path and ca_cert_path)
 
     class MetricsHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -263,21 +363,23 @@ def cmd_run(args):
             return
 
     def heartbeat_worker():
-        headers = {
-            "X-Agent-ID": agent_id,
-            "Authorization": f"Bearer {credential}",
-        }
+        headers = {"X-Agent-ID": agent_id}
+        if not has_mtls and credential:
+            headers["Authorization"] = f"Bearer {credential}"
         while True:
             try:
+                ssl_ctx = build_ssl_context(ca_cert_path, client_cert_path, client_key_path) if has_mtls else None
                 info = collect_system_info()
                 post_json(
                     f"{server_url}/api/agents/heartbeat",
-                    {"version": VERSION, "hostname": info["hostname"]},
+                    {"agent_id": agent_id, "version": VERSION, "hostname": info["hostname"]},
                     headers=headers,
+                    ssl_ctx=ssl_ctx,
                 )
                 post_json(
                     f"{server_url}/api/agents/system-info",
                     {
+                        "agent_id": agent_id,
                         "version": VERSION,
                         "hostname": info["hostname"],
                         "os_distribution": info["os_distribution"],
@@ -288,6 +390,7 @@ def cmd_run(args):
                         "uptime_seconds": info["uptime_seconds"],
                     },
                     headers=headers,
+                    ssl_ctx=ssl_ctx,
                 )
             except Exception:
                 pass
@@ -304,7 +407,7 @@ def cmd_run(args):
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
         print("Usage:")
-        print("  infralab-agent enroll --server https://infralab.example --token <TOKEN>")
+        print("  infralab-agent enroll --server https://infralab.example --token <TOKEN> [--ca-cert /path/to/ca.crt]")
         print("  infralab-agent run [--listen-addr :9101]")
         print("  infralab-agent version")
         sys.exit(0)
@@ -321,6 +424,7 @@ def main():
         p.add_argument("--listen-addr", default=DEFAULT_LISTEN_ADDR)
         p.add_argument("--config", default=DEFAULT_CONFIG_PATH)
         p.add_argument("--credentials", default=DEFAULT_CRED_PATH)
+        p.add_argument("--ca-cert", default="")
         cmd_enroll(p.parse_args(sys.argv[2:]))
         return
 

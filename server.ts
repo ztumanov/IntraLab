@@ -26,10 +26,14 @@ import {
   provisionAgentDirectlyForServer,
   recordAgentHeartbeat,
   recordAgentSystemInfo,
+  renewAgentCertificate,
+  revokeServerAgentCertificate,
   rotateServerEnrollmentToken,
   stopServerAgent,
   verifyAgentCredential,
+  verifyAgentMtlsCertificate,
 } from './src/db/agents.ts';
+import { getOrInitInfraLabCa } from './src/server/agentPki.ts';
 import { PORTABLE_AGENT_SCRIPT } from './src/server/portableAgentScript.ts';
 import {
   clearServerPrometheusCache,
@@ -1457,7 +1461,84 @@ export function createApp() {
     }
   });
 
-  // --- Linux Agent API Endpoints ---
+  // --- Linux Agent API Endpoints (mTLS + Transitional Bearer Enrollment) ---
+  function extractClientCertificateFromRequest(req: express.Request): string | Buffer | null {
+    const tlsSocket = req.socket as any;
+    if (tlsSocket && tlsSocket.encrypted) {
+      // Direct TLS socket: NEVER trust HTTP headers; only accept the peer certificate negotiated in the TLS handshake
+      if (typeof tlsSocket.getPeerCertificate === 'function') {
+        try {
+          const peerCert = tlsSocket.getPeerCertificate(false);
+          if (peerCert && Buffer.isBuffer(peerCert.raw) && peerCert.raw.length > 0) {
+            return peerCert.raw;
+          }
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    }
+
+    // Reverse-proxy mode (e.g. Traefik passTLSClientCert): only trust forwarded cert headers when allowed
+    if (process.env.AGENT_TRUST_PROXY_CERT_HEADER === 'false') {
+      return null;
+    }
+    const configuredProxySecret = (process.env.AGENT_PROXY_SECRET || '').trim();
+    if (configuredProxySecret) {
+      const providedSecret = String(req.headers['x-infralab-proxy-secret'] || '').trim();
+      if (providedSecret !== configuredProxySecret) {
+        return null;
+      }
+    }
+
+    const rawHeader =
+      String(
+        req.headers['x-forwarded-tls-client-cert'] ||
+          req.headers['x-ssl-client-cert'] ||
+          req.headers['x-client-cert'] ||
+          ''
+      ).trim();
+
+    if (!rawHeader) {
+      return null;
+    }
+
+    let candidate = rawHeader;
+    // Handle Envoy/Traefik XFCC format: Cert="-----BEGIN%20CERTIFICATE-----..."
+    const certMatch = candidate.match(/(?:^|[,;\s])Cert="?([^";,]+)"?/i);
+    if (certMatch) {
+      candidate = certMatch[1];
+    }
+
+    try {
+      if (candidate.includes('%')) {
+        candidate = decodeURIComponent(candidate);
+      }
+    } catch {
+      // Keep raw candidate if URI decoding fails
+    }
+
+    if (candidate.includes('-----BEGIN CERTIFICATE-----')) {
+      return candidate;
+    }
+
+    // Base64-encoded DER or Base64-encoded PEM
+    try {
+      const decoded = Buffer.from(candidate.replace(/\s+/g, ''), 'base64');
+      const asUtf8 = decoded.toString('utf8');
+      if (asUtf8.includes('-----BEGIN CERTIFICATE-----')) {
+        return asUtf8;
+      }
+      if (decoded.length > 64 && decoded[0] === 0x30) {
+        return decoded;
+      }
+    } catch {
+      // Invalid base64
+    }
+
+    return null;
+  }
+
   function extractAgentCredentials(req: express.Request): {
     agentId: string;
     credential: string;
@@ -1479,23 +1560,106 @@ export function createApp() {
     };
   }
 
+  async function authenticateAgentRequest(
+    req: express.Request,
+    options?: { requireMtls?: boolean }
+  ): Promise<{
+    id: number;
+    serverId: number;
+    agentId: string;
+    authMode: 'mtls' | 'bearer';
+  } | null> {
+    const headerAgentId = String(req.headers['x-agent-id'] || '').trim();
+    const bodyAgentId =
+      typeof req.body?.agent_id === 'string' ? req.body.agent_id.trim() : '';
+    const queryAgentId =
+      typeof req.query?.agent_id === 'string' ? req.query.agent_id.trim() : '';
+
+    // If both header and body/query agent_id are supplied, they must not conflict
+    if (headerAgentId && bodyAgentId && headerAgentId !== bodyAgentId) {
+      return null;
+    }
+    if (headerAgentId && queryAgentId && headerAgentId !== queryAgentId) {
+      return null;
+    }
+    if (bodyAgentId && queryAgentId && bodyAgentId !== queryAgentId) {
+      return null;
+    }
+
+    const clientCert = extractClientCertificateFromRequest(req);
+    if (clientCert) {
+      const verifiedMtls = await verifyAgentMtlsCertificate({
+        clientCertPemOrDer: clientCert,
+        headerAgentId: headerAgentId || undefined,
+        claimedAgentIds: [headerAgentId, bodyAgentId, queryAgentId],
+      });
+      if (!verifiedMtls) {
+        return null;
+      }
+      return {
+        id: verifiedMtls.id,
+        serverId: verifiedMtls.serverId,
+        agentId: verifiedMtls.agentId,
+        authMode: 'mtls',
+      };
+    }
+
+    if (options?.requireMtls) {
+      return null;
+    }
+
+    // Transitional Bearer fallback (for legacy agents not yet enrolled with mTLS)
+    const { agentId, credential } = extractAgentCredentials(req);
+    if (!agentId || !credential) {
+      return null;
+    }
+    const verifiedBearer = await verifyAgentCredential(agentId, credential);
+    if (!verifiedBearer) {
+      return null;
+    }
+    return {
+      ...verifiedBearer,
+      authMode: 'bearer',
+    };
+  }
+
+  app.get('/api/agents/ca.crt', (_req, res) => {
+    try {
+      const ca = getOrInitInfraLabCa();
+      res.setHeader('Content-Type', 'application/x-pem-file; charset=utf-8');
+      return res.status(200).send(ca.caCertPem);
+    } catch (error: any) {
+      return res.status(500).json({ error: 'Failed to load InfraLab Agent CA certificate' });
+    }
+  });
+
   app.post('/api/agents/enroll', async (req, res) => {
     try {
       const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
       const hostname =
         typeof req.body?.hostname === 'string' ? req.body.hostname.trim() : '';
       const version =
-        typeof req.body?.version === 'string' ? req.body.version.trim() : '0.1.0';
+        typeof req.body?.version === 'string' ? req.body.version.trim() : '0.2.0';
+      const csrPem =
+        typeof req.body?.csr_pem === 'string' ? req.body.csr_pem.trim() : '';
 
       if (!token) {
         return res.status(400).json({ error: 'Enrollment token is required' });
       }
 
-      const enrolled = await enrollAgentWithToken({
-        token,
-        hostname,
-        version,
-      });
+      let enrolled;
+      try {
+        enrolled = await enrollAgentWithToken({
+          token,
+          hostname,
+          version,
+          csrPem: csrPem || undefined,
+        });
+      } catch (csrErr: any) {
+        return res.status(400).json({
+          error: csrErr?.message || 'Invalid certificate signing request (CSR)',
+        });
+      }
 
       if (!enrolled) {
         return res
@@ -1503,19 +1667,38 @@ export function createApp() {
           .json({ error: 'Invalid or already consumed enrollment token' });
       }
 
-      // Return permanent credential once during enrollment; never log it
+      // Never log private keys, credentials, or enrollment tokens
       logger.info({
         component: 'agent',
         operation: 'enroll',
         server_id: enrolled.serverId,
         agent_id: enrolled.agentId,
+        auth_mode: enrolled.authMode,
+        cert_serial: enrolled.certSerial,
         hostname,
         version,
       });
+
+      if (enrolled.authMode === 'mtls') {
+        return res.status(200).json({
+          agent_id: enrolled.agentId,
+          server_id: enrolled.serverId,
+          auth_mode: 'mtls',
+          client_cert_pem: enrolled.clientCertPem,
+          ca_cert_pem: enrolled.caCertPem,
+          cert_serial: enrolled.certSerial,
+          cert_fingerprint_sha256: enrolled.certFingerprintSha256,
+          cert_san_uri: enrolled.certSanUri,
+          cert_not_before: enrolled.certNotBefore,
+          cert_not_after: enrolled.certNotAfter,
+        });
+      }
+
       return res.status(200).json({
         agent_id: enrolled.agentId,
         credential: enrolled.credential,
         server_id: enrolled.serverId,
+        auth_mode: 'bearer',
       });
     } catch (error: any) {
       logger.error({
@@ -1527,16 +1710,72 @@ export function createApp() {
     }
   });
 
-  app.post('/api/agents/heartbeat', async (req, res) => {
+  app.post('/api/agents/renew', async (req, res) => {
     try {
-      const { agentId, credential } = extractAgentCredentials(req);
-      if (!agentId || !credential) {
-        return res.status(401).json({ error: 'Missing agent authentication credentials' });
+      const verified = await authenticateAgentRequest(req, { requireMtls: true });
+      if (!verified) {
+        return res.status(401).json({
+          error: 'Valid mTLS client certificate is required for renewal',
+        });
       }
 
-      const verified = await verifyAgentCredential(agentId, credential);
+      const csrPem =
+        typeof req.body?.csr_pem === 'string' ? req.body.csr_pem.trim() : '';
+      if (!csrPem) {
+        return res.status(400).json({ error: 'csr_pem is required for certificate renewal' });
+      }
+
+      let renewed;
+      try {
+        renewed = await renewAgentCertificate({
+          agentId: verified.agentId,
+          csrPem,
+        });
+      } catch (csrErr: any) {
+        return res.status(400).json({
+          error: csrErr?.message || 'Invalid certificate signing request (CSR)',
+        });
+      }
+
+      if (!renewed) {
+        return res.status(401).json({ error: 'Agent certificate cannot be renewed' });
+      }
+
+      logger.info({
+        component: 'agent',
+        operation: 'renew_cert',
+        server_id: renewed.serverId,
+        agent_id: renewed.agentId,
+        cert_serial: renewed.certSerial,
+      });
+
+      return res.status(200).json({
+        agent_id: renewed.agentId,
+        server_id: renewed.serverId,
+        auth_mode: 'mtls',
+        client_cert_pem: renewed.clientCertPem,
+        ca_cert_pem: renewed.caCertPem,
+        cert_serial: renewed.certSerial,
+        cert_fingerprint_sha256: renewed.certFingerprintSha256,
+        cert_san_uri: renewed.certSanUri,
+        cert_not_before: renewed.certNotBefore,
+        cert_not_after: renewed.certNotAfter,
+      });
+    } catch (error: any) {
+      logger.error({
+        component: 'agent',
+        operation: 'renew_cert',
+        error: error?.message || 'Internal error',
+      });
+      return res.status(500).json({ error: 'Failed to renew agent certificate' });
+    }
+  });
+
+  app.post('/api/agents/heartbeat', async (req, res) => {
+    try {
+      const verified = await authenticateAgentRequest(req);
       if (!verified) {
-        return res.status(401).json({ error: 'Invalid agent ID or credential' });
+        return res.status(401).json({ error: 'Invalid or missing agent mTLS certificate or credential' });
       }
 
       const version =
@@ -1553,6 +1792,7 @@ export function createApp() {
       return res.status(200).json({
         status: 'ok',
         agent_id: verified.agentId,
+        auth_mode: verified.authMode,
         last_seen_at: seenAt.toISOString(),
       });
     } catch (error: any) {
@@ -1567,14 +1807,9 @@ export function createApp() {
 
   app.post('/api/agents/system-info', async (req, res) => {
     try {
-      const { agentId, credential } = extractAgentCredentials(req);
-      if (!agentId || !credential) {
-        return res.status(401).json({ error: 'Missing agent authentication credentials' });
-      }
-
-      const verified = await verifyAgentCredential(agentId, credential);
+      const verified = await authenticateAgentRequest(req);
       if (!verified) {
-        return res.status(401).json({ error: 'Invalid agent ID or credential' });
+        return res.status(401).json({ error: 'Invalid or missing agent mTLS certificate or credential' });
       }
 
       const seenAt = await recordAgentSystemInfo({
@@ -1598,6 +1833,7 @@ export function createApp() {
       return res.status(200).json({
         status: 'ok',
         agent_id: verified.agentId,
+        auth_mode: verified.authMode,
         last_seen_at: seenAt.toISOString(),
       });
     } catch (error: any) {
@@ -1632,6 +1868,7 @@ export function createApp() {
       if (
         agentView.agent_id &&
         agentView.version !== 'stopped' &&
+        !agentView.cert_revoked_at &&
         lastSeenAgeMs > 25000
       ) {
         let refreshedViaHttp = false;
@@ -1741,10 +1978,61 @@ export function createApp() {
       const serverOrigin =
         String(req.body?.server_url || process.env.APP_URL || 'https://infralab.local').replace(/\/+$/, '');
 
+      // Step 1: Generate private key (0600) and CSR directly on the remote Agent host over SSH.
+      // Only the public CSR is returned to the Backend; the private key never leaves the Agent host.
+      const csrGenCmd = [
+        'set -e',
+        'SUDO=""; if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi',
+        '$SUDO mkdir -p /var/lib/infralab-agent',
+        '$SUDO chmod 0700 /var/lib/infralab-agent',
+        'umask 077',
+        '$SUDO openssl ecparam -name prime256v1 -genkey -noout -out /var/lib/infralab-agent/agent.key.ec',
+        '$SUDO openssl pkcs8 -topk8 -nocrypt -in /var/lib/infralab-agent/agent.key.ec -out /var/lib/infralab-agent/agent.key.tmp',
+        '$SUDO rm -f /var/lib/infralab-agent/agent.key.ec',
+        '$SUDO chmod 0600 /var/lib/infralab-agent/agent.key.tmp',
+        '$SUDO mv /var/lib/infralab-agent/agent.key.tmp /var/lib/infralab-agent/agent.key',
+        '$SUDO chmod 0600 /var/lib/infralab-agent/agent.key',
+        'H=$(hostname 2>/dev/null || echo linux-host)',
+        '$SUDO openssl req -new -sha256 -key /var/lib/infralab-agent/agent.key -subj "/O=InfraLab Agent/CN=$H" -out /var/lib/infralab-agent/agent.csr',
+        'CSR_B64=$($SUDO base64 -w0 /var/lib/infralab-agent/agent.csr 2>/dev/null || $SUDO base64 /var/lib/infralab-agent/agent.csr | tr -d "\\n")',
+        '$SUDO rm -f /var/lib/infralab-agent/agent.csr',
+        'echo "INFRALAB_CSR_B64|$CSR_B64"',
+      ].join('\n');
+
+      const csrExec = await executeSshCommand({
+        ipAddress: server.ipAddress,
+        sshPort: server.sshPort,
+        username: server.username,
+        authType: server.authType === 'private_key' ? 'private_key' : 'password',
+        encryptedSecret: server.encryptedSecret,
+        command: csrGenCmd,
+      });
+
+      if (csrExec.exitCode !== 0) {
+        return res.status(502).json({
+          error: `SSH генерация CSR завершилась с кодом ${csrExec.exitCode}: ${
+            csrExec.stderr || csrExec.stdout || 'Unknown SSH error'
+          }`,
+        });
+      }
+
+      const csrLine = (csrExec.stdout || '')
+        .split('\n')
+        .find((l) => l.startsWith('INFRALAB_CSR_B64|'));
+      const csrB64 = csrLine ? csrLine.slice('INFRALAB_CSR_B64|'.length).trim() : '';
+      const remoteCsrPem = csrB64 ? Buffer.from(csrB64, 'base64').toString('utf8') : '';
+      if (!remoteCsrPem.includes('BEGIN CERTIFICATE REQUEST')) {
+        return res.status(502).json({
+          error: 'Не удалось получить корректный PKCS#10 CSR от удалённого агента',
+        });
+      }
+
+      // Step 2: Sign the Agent's CSR with InfraLab Root CA (no private key on Backend)
       const provisioned = await provisionAgentDirectlyForServer({
         serverId: server.id,
         hostname: server.hostname,
         version: '0.2.0',
+        csrPem: remoteCsrPem,
       });
 
       const agentScriptB64 = Buffer.from(PORTABLE_AGENT_SCRIPT, 'utf8').toString('base64');
@@ -1765,13 +2053,21 @@ export function createApp() {
           {
             server_url: serverOrigin,
             agent_id: provisioned.agentId,
-            credential: provisioned.credential,
+            auth_mode: 'mtls',
+            client_cert_path: '/var/lib/infralab-agent/agent.crt',
+            client_key_path: '/var/lib/infralab-agent/agent.key',
+            ca_cert_path: '/var/lib/infralab-agent/ca.crt',
+            cert_serial: provisioned.certSerial,
+            cert_fingerprint_sha256: provisioned.certFingerprintSha256,
+            cert_not_after: provisioned.certNotAfter,
           },
           null,
           2
         ),
         'utf8'
       ).toString('base64');
+      const clientCertB64 = Buffer.from(provisioned.clientCertPem, 'utf8').toString('base64');
+      const caCertB64 = Buffer.from(provisioned.caCertPem, 'utf8').toString('base64');
 
       const systemdUnit = `[Unit]
 Description=InfraLab Linux Telemetry & Prometheus Exporter Agent
@@ -1794,11 +2090,20 @@ WantedBy=multi-user.target
         'set -e',
         'SUDO=""; if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi',
         '$SUDO mkdir -p /usr/local/bin /etc/infralab-agent /var/lib/infralab-agent',
+        '$SUDO chmod 0700 /var/lib/infralab-agent',
         `echo '${agentScriptB64}' | base64 -d | $SUDO tee /usr/local/bin/infralab-agent >/dev/null`,
         '$SUDO chmod 0755 /usr/local/bin/infralab-agent',
         `echo '${configJsonB64}' | base64 -d | $SUDO tee /etc/infralab-agent/config.json >/dev/null`,
-        `echo '${credJsonB64}' | base64 -d | $SUDO tee /var/lib/infralab-agent/credentials.json >/dev/null`,
-        '$SUDO chmod 0600 /var/lib/infralab-agent/credentials.json',
+        `echo '${caCertB64}' | base64 -d | $SUDO tee /var/lib/infralab-agent/ca.crt.tmp >/dev/null`,
+        '$SUDO chmod 0644 /var/lib/infralab-agent/ca.crt.tmp',
+        '$SUDO mv /var/lib/infralab-agent/ca.crt.tmp /var/lib/infralab-agent/ca.crt',
+        `echo '${clientCertB64}' | base64 -d | $SUDO tee /var/lib/infralab-agent/agent.crt.tmp >/dev/null`,
+        '$SUDO chmod 0600 /var/lib/infralab-agent/agent.crt.tmp',
+        '$SUDO mv /var/lib/infralab-agent/agent.crt.tmp /var/lib/infralab-agent/agent.crt',
+        '$SUDO chmod 0600 /var/lib/infralab-agent/agent.key',
+        `echo '${credJsonB64}' | base64 -d | $SUDO tee /var/lib/infralab-agent/credentials.json.tmp >/dev/null`,
+        '$SUDO chmod 0600 /var/lib/infralab-agent/credentials.json.tmp',
+        '$SUDO mv /var/lib/infralab-agent/credentials.json.tmp /var/lib/infralab-agent/credentials.json',
         'if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then',
         `  echo '${unitB64}' | base64 -d | $SUDO tee /etc/systemd/system/infralab-agent.service >/dev/null`,
         '  $SUDO systemctl daemon-reload',
@@ -1936,6 +2241,39 @@ WantedBy=multi-user.target
     } catch (error: any) {
       console.error('POST /api/servers/:id/agent/token failed:', error?.message || 'Internal error');
       return res.status(500).json({ error: 'Failed to rotate enrollment token' });
+    }
+  });
+
+  app.post('/api/servers/:id/agent/revoke', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid server ID' });
+      }
+
+      const server = await getServerById(id, uid);
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+
+      const reason =
+        typeof req.body?.reason === 'string' && req.body.reason.trim()
+          ? req.body.reason.trim()
+          : 'revoked_by_operator';
+
+      clearServerPrometheusCache(server.id);
+      const revokedView = await revokeServerAgentCertificate(server.id, reason);
+      logger.info({
+        component: 'agent',
+        operation: 'revoke_cert',
+        server_id: server.id,
+        agent_id: revokedView.agent_id,
+      });
+      return res.status(200).json(revokedView);
+    } catch (error: any) {
+      console.error('POST /api/servers/:id/agent/revoke failed:', error?.message || 'Internal error');
+      return res.status(500).json({ error: 'Failed to revoke agent certificate' });
     }
   });
 
@@ -2276,6 +2614,12 @@ async function startServer() {
   });
 }
 
-if (process.env.NODE_ENV !== 'test') {
+const isTestRunner =
+  process.env.NODE_ENV === 'test' ||
+  Boolean(process.env.NODE_TEST_CONTEXT) ||
+  process.argv.includes('--test') ||
+  process.execArgv.includes('--test');
+
+if (!isTestRunner) {
   startServer();
 }

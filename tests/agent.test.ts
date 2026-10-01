@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
 import { eq } from 'drizzle-orm';
 import { db } from '../src/db/index.ts';
-import { users } from '../src/db/schema.ts';
+import { agents, users } from '../src/db/schema.ts';
 import { createServerRecord, deleteServerById } from '../src/db/servers.ts';
 import {
   enrollAgentWithToken,
@@ -12,10 +14,22 @@ import {
   provisionAgentDirectlyForServer,
   recordAgentHeartbeat,
   recordAgentSystemInfo,
+  renewAgentCertificate,
+  revokeServerAgentCertificate,
   rotateServerEnrollmentToken,
   stopServerAgent,
   verifyAgentCredential,
+  verifyAgentMtlsCertificate,
 } from '../src/db/agents.ts';
+import {
+  generateAgentKeyPairAndCsrPem,
+  generateRootCaKeyPairAndCert,
+  generateServerTlsKeyPairAndCert,
+  getOrInitInfraLabCa,
+  signAgentCsr,
+  verifyClientCertAgainstCa,
+} from '../src/server/agentPki.ts';
+import { createApp } from '../server.ts';
 import { formatStructuredLog, sanitizeLogFields } from '../src/lib/logger.ts';
 import {
   buildPromQLQueriesForServer,
@@ -318,3 +332,408 @@ test('Structured logger redacts passwords, tokens, private keys, and authorizati
   assert.ok(line.includes('encryptedSecret=[REDACTED]'));
   assert.ok(!line.includes('aes-cipher'));
 });
+
+test('Agent mTLS PKI: CSR enrollment, SPIFFE SAN verification, rogue CA & expiry rejection, renewal, and revocation', async () => {
+  const testUserUid = 'test-user-agent-mtls-suite';
+  await db
+    .insert(users)
+    .values({
+      uid: testUserUid,
+      email: 'mtls-test@infralab.local',
+      username: 'mtls-test-runner',
+    })
+    .onConflictDoNothing();
+
+  const server = await createServerRecord({
+    userUid: testUserUid,
+    name: 'mtls-test-node',
+    hostname: 'mtls-node.internal',
+    ipAddress: '10.99.0.77',
+    sshPort: 22,
+    username: 'root',
+    authType: 'password',
+    encryptedSecret: '',
+    description: 'Temporary server for Agent mTLS PKI integration test',
+  });
+
+  try {
+    const initial = await getOrProvisionServerAgent(server.id);
+    assert.ok(initial.enrollment_token, 'Expected one-time enrollment token');
+
+    // 1. Agent generates ECDSA P-256 keypair and CSR locally (private key never sent to backend)
+    const { privateKeyPem, csrPem } = generateAgentKeyPairAndCsrPem('mtls-node.internal');
+    assert.ok(privateKeyPem.includes('BEGIN PRIVATE KEY'));
+    assert.ok(csrPem.includes('BEGIN CERTIFICATE REQUEST'));
+    assert.ok(!csrPem.includes('PRIVATE KEY'), 'CSR must never contain private key');
+
+    // 2. Enroll with token + CSR
+    const enrolled = await enrollAgentWithToken({
+      token: initial.enrollment_token!,
+      hostname: 'mtls-node.internal',
+      version: '0.2.0',
+      csrPem,
+      ttlHours: 48,
+    });
+    assert.ok(enrolled, 'mTLS CSR enrollment must succeed');
+    assert.equal(enrolled.authMode, 'mtls');
+    assert.equal(enrolled.credential, '', 'mTLS enrollment must not issue legacy bearer credential');
+    assert.ok(enrolled.clientCertPem?.includes('BEGIN CERTIFICATE'));
+    assert.ok(enrolled.caCertPem?.includes('BEGIN CERTIFICATE'));
+    assert.equal(enrolled.certSanUri, `spiffe://infralab/agent/${enrolled.agentId}`);
+
+    // 3. Verify valid mTLS client certificate
+    const validMtls = await verifyAgentMtlsCertificate({
+      clientCertPemOrDer: enrolled.clientCertPem!,
+      headerAgentId: enrolled.agentId,
+    });
+    assert.ok(validMtls, 'Signed client certificate must pass mTLS verification');
+    assert.equal(validMtls.agentId, enrolled.agentId);
+    assert.equal(validMtls.serverId, server.id);
+
+    // 4. Reject X-Agent-ID header spoofing
+    const spoofedHeader = await verifyAgentMtlsCertificate({
+      clientCertPemOrDer: enrolled.clientCertPem!,
+      headerAgentId: 'agt_spoofed_other_agent',
+    });
+    assert.equal(spoofedHeader, null, 'Mismatched X-Agent-ID header must be rejected');
+
+    // 5. Reject certificate signed by a rogue CA
+    const rogueCa = generateRootCaKeyPairAndCert('Rogue Untrusted CA');
+    const rogueSigned = signAgentCsr({
+      csrPem,
+      agentId: enrolled.agentId,
+      caBundle: rogueCa,
+    });
+    const rogueVerify = await verifyAgentMtlsCertificate({
+      clientCertPemOrDer: rogueSigned.clientCertPem,
+    });
+    assert.equal(rogueVerify, null, 'Certificate signed by rogue CA must be rejected');
+
+    // 6. Reject expired certificate
+    const futureDate = new Date(Date.now() + 72 * 3600 * 1000);
+    const expiredVerify = await verifyAgentMtlsCertificate({
+      clientCertPemOrDer: enrolled.clientCertPem!,
+      now: futureDate,
+    });
+    assert.equal(expiredVerify, null, 'Expired certificate must be rejected');
+
+    // 7. Renew certificate with a fresh CSR and verify old certificate is invalidated
+    const { csrPem: renewedCsrPem } = generateAgentKeyPairAndCsrPem(enrolled.agentId);
+    const renewed = await renewAgentCertificate({
+      agentId: enrolled.agentId,
+      csrPem: renewedCsrPem,
+      ttlHours: 72,
+    });
+    assert.ok(renewed, 'Certificate renewal must succeed');
+    assert.notEqual(renewed.certSerial, enrolled.certSerial);
+
+    const oldCertAfterRenew = await verifyAgentMtlsCertificate({
+      clientCertPemOrDer: enrolled.clientCertPem!,
+    });
+    assert.equal(
+      oldCertAfterRenew,
+      null,
+      'Old certificate must be rejected after renewal rotates serial/fingerprint'
+    );
+
+    const newCertAfterRenew = await verifyAgentMtlsCertificate({
+      clientCertPemOrDer: renewed.clientCertPem,
+    });
+    assert.ok(newCertAfterRenew, 'Renewed certificate must pass verification');
+
+    // 8. Revoke certificate and verify immediate rejection
+    const revokedView = await revokeServerAgentCertificate(server.id, 'security_rotation');
+    assert.equal(revokedView.status, 'OFFLINE');
+    assert.ok(revokedView.cert_revoked_at, 'cert_revoked_at must be populated');
+
+    const afterRevokeVerify = await verifyAgentMtlsCertificate({
+      clientCertPemOrDer: renewed.clientCertPem,
+    });
+    assert.equal(afterRevokeVerify, null, 'Revoked certificate must be rejected immediately');
+  } finally {
+    await deleteServerById(server.id, testUserUid);
+    await db.delete(users).where(eq(users.uid, testUserUid));
+  }
+});
+
+test('Agent mTLS Full Security & E2E Audit: real TLS handshake, Agent A cert + Agent B ID rejection, EKU validation, header spoofing protection, and DB non-secret audit', async () => {
+  const testUserUid = 'test-user-agent-mtls-e2e-audit';
+  await db
+    .insert(users)
+    .values({
+      uid: testUserUid,
+      email: 'mtls-e2e-audit@infralab.local',
+      username: 'mtls-e2e-auditor',
+    })
+    .onConflictDoNothing();
+
+  const serverA = await createServerRecord({
+    userUid: testUserUid,
+    name: 'mtls-audit-node-a',
+    hostname: 'node-a.internal',
+    ipAddress: '10.99.1.10',
+    sshPort: 22,
+    username: 'root',
+    authType: 'password',
+    encryptedSecret: '',
+    description: 'Audit node A',
+  });
+
+  const serverB = await createServerRecord({
+    userUid: testUserUid,
+    name: 'mtls-audit-node-b',
+    hostname: 'node-b.internal',
+    ipAddress: '10.99.1.11',
+    sshPort: 22,
+    username: 'root',
+    authType: 'password',
+    encryptedSecret: '',
+    description: 'Audit node B',
+  });
+
+  const ca = getOrInitInfraLabCa();
+  const srvTls = generateServerTlsKeyPairAndCert({
+    commonName: '127.0.0.1',
+    dnsNames: ['localhost'],
+    ipAddresses: ['127.0.0.1'],
+    caBundle: ca,
+  });
+
+  const app = createApp();
+  const httpsServer = https.createServer(
+    {
+      key: srvTls.serverKeyPem,
+      cert: srvTls.serverCertPem,
+      ca: ca.caCertPem,
+      minVersion: 'TLSv1.2',
+      requestCert: true,
+      rejectUnauthorized: false,
+    },
+    app
+  );
+
+  await new Promise<void>((resolve) => httpsServer.listen(0, '127.0.0.1', resolve));
+  const port = (httpsServer.address() as { port: number }).port;
+
+  function httpsPostJson(options: {
+    path: string;
+    body: Record<string, any>;
+    cert?: string;
+    key?: string;
+    headers?: Record<string, string>;
+  }): Promise<{ status: number; data: any; tlsProtocol: string | null }> {
+    return new Promise((resolve, reject) => {
+      const payload = JSON.stringify(options.body);
+      const req = https.request(
+        {
+          hostname: '127.0.0.1',
+          port,
+          path: options.path,
+          method: 'POST',
+          ca: ca.caCertPem,
+          cert: options.cert,
+          key: options.key,
+          minVersion: 'TLSv1.2',
+          rejectUnauthorized: true,
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': String(Buffer.byteLength(payload)),
+            Connection: 'close',
+            ...(options.headers || {}),
+          },
+        },
+        (res) => {
+          const tlsSocket = res.socket as tls.TLSSocket;
+          const tlsProtocol =
+            typeof tlsSocket.getProtocol === 'function' ? tlsSocket.getProtocol() : null;
+          let raw = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk) => {
+            raw += chunk;
+          });
+          res.on('end', () => {
+            let parsed: any = raw;
+            try {
+              parsed = JSON.parse(raw);
+            } catch {
+              // keep raw
+            }
+            resolve({ status: res.statusCode || 0, data: parsed, tlsProtocol });
+          });
+        }
+      );
+      req.on('error', reject);
+      req.write(payload);
+      req.end();
+    });
+  }
+
+  try {
+    // 1. Reject server certificate (ExtKeyUsage = serverAuth instead of clientAuth) when validated as client cert (BUG-MTLS-01 regression)
+    assert.throws(
+      () => verifyClientCertAgainstCa(srvTls.serverCertPem, ca),
+      /ExtendedKeyUsage clientAuth|SPIFFE/i,
+      'Server certificate with serverAuth EKU must be rejected as a client certificate'
+    );
+    assert.throws(
+      () => verifyClientCertAgainstCa(ca.caCertPem, ca),
+      /must not be a CA certificate/i,
+      'CA certificate must be rejected as a client certificate'
+    );
+
+    // 2. Provision enrollment tokens for Agent A and Agent B
+    const initA = await getOrProvisionServerAgent(serverA.id);
+    const initB = await getOrProvisionServerAgent(serverB.id);
+    assert.ok(initA.enrollment_token);
+    assert.ok(initB.enrollment_token);
+
+    // 3. Agent A and Agent B generate their private keys and CSRs locally
+    const keyCsrA = generateAgentKeyPairAndCsrPem('node-a.internal');
+    const keyCsrB = generateAgentKeyPairAndCsrPem('node-b.internal');
+
+    // 4. Enroll Agent A and Agent B over HTTPS
+    const enrollRespA = await httpsPostJson({
+      path: '/api/agents/enroll',
+      body: {
+        token: initA.enrollment_token,
+        hostname: 'node-a.internal',
+        version: '0.2.0',
+        csr_pem: keyCsrA.csrPem,
+      },
+    });
+    assert.equal(enrollRespA.status, 200);
+    assert.ok(
+      enrollRespA.tlsProtocol === 'TLSv1.2' || enrollRespA.tlsProtocol === 'TLSv1.3',
+      `Expected TLSv1.2 or TLSv1.3, got ${enrollRespA.tlsProtocol}`
+    );
+    const agentAId: string = enrollRespA.data.agent_id;
+    const certAPem: string = enrollRespA.data.client_cert_pem;
+    assert.ok(agentAId.startsWith('agt_'));
+    assert.equal(enrollRespA.data.auth_mode, 'mtls');
+    assert.equal('credential' in enrollRespA.data, false, 'mTLS enroll response must not include credential');
+
+    const enrollRespB = await httpsPostJson({
+      path: '/api/agents/enroll',
+      body: {
+        token: initB.enrollment_token,
+        hostname: 'node-b.internal',
+        version: '0.2.0',
+        csr_pem: keyCsrB.csrPem,
+      },
+    });
+    assert.equal(enrollRespB.status, 200);
+    const agentBId: string = enrollRespB.data.agent_id;
+
+    // 5. Verify PostgreSQL agents table NEVER stores private keys or raw tokens
+    const dbRowsA = await db.select().from(agents).where(eq(agents.agentId, agentAId));
+    assert.equal(dbRowsA.length, 1);
+    const serializedRowA = JSON.stringify(dbRowsA[0]);
+    assert.ok(!serializedRowA.includes('PRIVATE KEY'), 'PostgreSQL must never contain private keys');
+    assert.equal(dbRowsA[0].enrollmentTokenHash, '', 'Consumed token hash must be cleared');
+    assert.equal(dbRowsA[0].enrollmentTokenEncrypted, '', 'Consumed encrypted token must be cleared');
+    assert.equal(dbRowsA[0].credentialHash, '', 'mTLS agent must have empty credentialHash');
+
+    // 6. Real mTLS handshake with valid Agent A client certificate + private key -> 200 OK
+    const validHb = await httpsPostJson({
+      path: '/api/agents/heartbeat',
+      cert: certAPem,
+      key: keyCsrA.privateKeyPem,
+      headers: { 'X-Agent-ID': agentAId },
+      body: { agent_id: agentAId, version: '0.2.0', hostname: 'node-a.internal' },
+    });
+    assert.equal(validHb.status, 200);
+    assert.equal(validHb.data.auth_mode, 'mtls');
+    assert.equal(validHb.data.agent_id, agentAId);
+
+    // 7. No client certificate over TLS -> 401 REJECT
+    const noCertHb = await httpsPostJson({
+      path: '/api/agents/heartbeat',
+      headers: { 'X-Agent-ID': agentAId },
+      body: { agent_id: agentAId, version: '0.2.0', hostname: 'node-a.internal' },
+    });
+    assert.equal(noCertHb.status, 401, 'Missing client certificate must be rejected with 401');
+
+    // 8. Regression test for BUG-MTLS-03: No client cert in TLS handshake + spoofed X-Forwarded-TLS-Client-Cert header over direct TLS -> 401 REJECT
+    const spoofedCertHeaderOverTls = await httpsPostJson({
+      path: '/api/agents/heartbeat',
+      headers: {
+        'X-Agent-ID': agentAId,
+        'X-Forwarded-TLS-Client-Cert': encodeURIComponent(certAPem),
+        'X-SSL-Client-Cert': encodeURIComponent(certAPem),
+      },
+      body: { agent_id: agentAId, version: '0.2.0', hostname: 'node-a.internal' },
+    });
+    assert.equal(
+      spoofedCertHeaderOverTls.status,
+      401,
+      'Forwarded cert headers must be ignored on direct TLS connections when no peer cert was presented in handshake'
+    );
+
+    // 9. Critical Section 5 check: Agent A certificate + Agent B ID in X-Agent-ID header -> 401 REJECT
+    const crossAgentHeader = await httpsPostJson({
+      path: '/api/agents/heartbeat',
+      cert: certAPem,
+      key: keyCsrA.privateKeyPem,
+      headers: { 'X-Agent-ID': agentBId },
+      body: { version: '0.2.0', hostname: 'node-a.internal' },
+    });
+    assert.equal(crossAgentHeader.status, 401, 'Agent A cert + Agent B X-Agent-ID header must be rejected with 401');
+
+    // 10. Critical Section 5 check: Agent A certificate + Agent B ID in JSON body (with NO X-Agent-ID header) -> 401 REJECT
+    const crossAgentBodyOnly = await httpsPostJson({
+      path: '/api/agents/heartbeat',
+      cert: certAPem,
+      key: keyCsrA.privateKeyPem,
+      body: { agent_id: agentBId, version: '0.2.0', hostname: 'node-a.internal' },
+    });
+    assert.equal(crossAgentBodyOnly.status, 401, 'Agent A cert + Agent B body.agent_id must be rejected with 401');
+
+    // 11. Regression test for BUG-MTLS-02: Agent A certificate + Agent A X-Agent-ID header + Agent B body.agent_id -> 401 REJECT
+    const crossAgentHeaderAndBody = await httpsPostJson({
+      path: '/api/agents/heartbeat',
+      cert: certAPem,
+      key: keyCsrA.privateKeyPem,
+      headers: { 'X-Agent-ID': agentAId },
+      body: { agent_id: agentBId, version: '0.2.0', hostname: 'node-a.internal' },
+    });
+    assert.equal(
+      crossAgentHeaderAndBody.status,
+      401,
+      'Agent A cert + Agent A header + Agent B body.agent_id must be rejected with 401'
+    );
+
+    // 12. Certificate signed by unknown / rogue CA over real TLS handshake -> 401 REJECT
+    const rogueCa = generateRootCaKeyPairAndCert('Rogue CA');
+    const rogueSigned = signAgentCsr({
+      csrPem: keyCsrA.csrPem,
+      agentId: agentAId,
+      caBundle: rogueCa,
+    });
+    const rogueTlsHb = await httpsPostJson({
+      path: '/api/agents/heartbeat',
+      cert: rogueSigned.clientCertPem,
+      key: keyCsrA.privateKeyPem,
+      headers: { 'X-Agent-ID': agentAId },
+      body: { agent_id: agentAId, version: '0.2.0', hostname: 'node-a.internal' },
+    });
+    assert.equal(rogueTlsHb.status, 401, 'Rogue CA certificate over TLS handshake must be rejected with 401');
+
+    // 13. Revoke Agent A certificate and verify real TLS handshake is immediately rejected with 401
+    await revokeServerAgentCertificate(serverA.id, 'audit_revocation_test');
+    const revokedTlsHb = await httpsPostJson({
+      path: '/api/agents/heartbeat',
+      cert: certAPem,
+      key: keyCsrA.privateKeyPem,
+      headers: { 'X-Agent-ID': agentAId },
+      body: { agent_id: agentAId, version: '0.2.0', hostname: 'node-a.internal' },
+    });
+    assert.equal(revokedTlsHb.status, 401, 'Revoked certificate over TLS must be rejected with 401');
+  } finally {
+    await new Promise<void>((resolve) => httpsServer.close(() => resolve()));
+    await deleteServerById(serverA.id, testUserUid);
+    await deleteServerById(serverB.id, testUserUid);
+    await db.delete(users).where(eq(users.uid, testUserUid));
+  }
+});
+
+

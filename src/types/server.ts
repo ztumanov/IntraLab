@@ -224,6 +224,7 @@ export interface HealthStatus {
 }
 
 export type AgentInstallStatus = 'ONLINE' | 'OFFLINE' | 'NOT INSTALLED';
+export type AgentAuthMode = 'mtls' | 'bearer';
 
 export interface ServerAgentInfo {
   server_id: number;
@@ -237,6 +238,15 @@ export interface ServerAgentInfo {
   cpu_count: number;
   ram_total_bytes: number;
   uptime_seconds: number;
+  auth_mode?: AgentAuthMode;
+  cert_serial?: string;
+  cert_fingerprint_sha256?: string;
+  cert_subject?: string;
+  cert_san_uri?: string;
+  cert_not_before?: string | null;
+  cert_not_after?: string | null;
+  cert_revoked_at?: string | null;
+  cert_revocation_reason?: string;
   last_seen_at: string | null;
   created_at: string | null;
   updated_at: string | null;

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -64,9 +67,27 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  infralab-agent enroll --server https://infralab.example --token <TOKEN>")
+	fmt.Fprintln(w, "  infralab-agent enroll --server https://infralab.example --token <TOKEN> [--ca-cert /path/to/ca.crt]")
 	fmt.Fprintln(w, "  infralab-agent run [--listen-addr :9101]")
 	fmt.Fprintln(w, "  infralab-agent version")
+}
+
+func buildBootstrapClient(serverURL, caCertPath string) (*client.Client, error) {
+	if strings.TrimSpace(caCertPath) == "" {
+		return client.New(serverURL), nil
+	}
+	caBytes, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("read bootstrap CA cert %s: %w", caCertPath, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caBytes) {
+		return nil, fmt.Errorf("invalid bootstrap CA PEM in %s", caCertPath)
+	}
+	return client.NewWithTLS(serverURL, &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    pool,
+	}), nil
 }
 
 func runEnrollCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -78,6 +99,7 @@ func runEnrollCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	listenAddr := fs.String("listen-addr", config.DefaultMetricsListenAddr, "Prometheus /metrics HTTP listen address")
 	configPath := fs.String("config", config.DefaultConfigPath, "Path to agent config file")
 	identityPath := fs.String("credentials", identity.DefaultIdentityPath, "Path to agent credentials file (0600)")
+	caCertFlag := fs.String("ca-cert", "", "Optional bootstrap Root CA certificate path for HTTPS enrollment")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -102,8 +124,18 @@ func runEnrollCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	collector := system.NewCollector()
 	sysInfo := collector.Collect()
 
-	apiClient := client.New(cfg.ServerURL)
-	enrollResp, err := apiClient.Enroll(ctx, *token, sysInfo.Hostname, Version)
+	// Generate private key and CSR locally on the Agent; private key never leaves the Agent.
+	privKeyPEM, csrPEM, err := identity.GenerateKeyAndCSR(sysInfo.Hostname)
+	if err != nil {
+		return fmt.Errorf("generate agent keypair and CSR: %w", err)
+	}
+
+	apiClient, err := buildBootstrapClient(cfg.ServerURL, *caCertFlag)
+	if err != nil {
+		return err
+	}
+
+	enrollResp, err := apiClient.EnrollWithCSR(ctx, *token, sysInfo.Hostname, Version, csrPEM)
 	if err != nil {
 		return fmt.Errorf("enrollment failed: %w", err)
 	}
@@ -115,18 +147,43 @@ func runEnrollCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	id := &identity.Identity{
 		ServerURL:  cfg.ServerURL,
 		AgentID:    enrollResp.AgentID,
+		AuthMode:   enrollResp.AuthMode,
 		Credential: enrollResp.Credential,
 	}
+
+	if strings.TrimSpace(enrollResp.ClientCertPEM) != "" && strings.TrimSpace(enrollResp.CACertPEM) != "" {
+		pkiDir := filepath.Dir(*identityPath)
+		keyPath, certPath, caPath, saveErr := identity.SaveMTLSFiles(
+			pkiDir,
+			privKeyPEM,
+			enrollResp.ClientCertPEM,
+			enrollResp.CACertPEM,
+		)
+		if saveErr != nil {
+			return fmt.Errorf("save mTLS certificates: %w", saveErr)
+		}
+		id.AuthMode = "mtls"
+		id.ClientKeyPath = keyPath
+		id.ClientCertPath = certPath
+		id.CACertPath = caPath
+		id.CertSerial = enrollResp.CertSerial
+		id.CertFingerprintSHA256 = enrollResp.CertFingerprintSHA256
+		id.CertSANURI = enrollResp.CertSANURI
+		id.CertNotBefore = enrollResp.CertNotBefore
+		id.CertNotAfter = enrollResp.CertNotAfter
+	}
+
 	if err := identity.Save(*identityPath, id); err != nil {
 		return fmt.Errorf("save credentials: %w", err)
 	}
 
-	// Never log or print the credential or enrollment token.
+	// Never log or print the private key, credential, or enrollment token.
 	fmt.Fprintf(
 		stdout,
-		"Successfully enrolled agent %s with %s (credentials stored at %s with mode 0600)\n",
+		"Successfully enrolled agent %s with %s (mode=%s, credentials stored at %s with mode 0600)\n",
 		id.AgentID,
 		cfg.ServerURL,
+		id.AuthMode,
 		*identityPath,
 	)
 	return nil
@@ -164,6 +221,11 @@ func runDaemonCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 
 	apiClient := client.New(cfg.ServerURL)
+	if id.HasMTLS() {
+		if err := apiClient.ConfigureMTLS(id); err != nil {
+			return fmt.Errorf("configure mTLS transport: %w", err)
+		}
+	}
 	collector := system.NewCollector()
 
 	// Start Prometheus /metrics HTTP exporter server
@@ -190,8 +252,68 @@ func runDaemonCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
 
-	logger.Printf("starting daemon v%s for agent_id=%s server=%s", Version, id.AgentID, cfg.ServerURL)
-	return runAgentLoop(ctx, logger, apiClient, collector, id, cfg.HeartbeatInterval())
+	logger.Printf("starting daemon v%s for agent_id=%s auth_mode=%s server=%s", Version, id.AgentID, id.AuthMode, cfg.ServerURL)
+	return runAgentLoop(ctx, logger, apiClient, collector, id, *identityPath, cfg.HeartbeatInterval())
+}
+
+func maybeRenewCertificate(
+	ctx context.Context,
+	logger *log.Logger,
+	apiClient *client.Client,
+	id *identity.Identity,
+	identityPath string,
+) {
+	if id == nil || !id.HasMTLS() {
+		return
+	}
+	if !id.NeedsRenewal(time.Now().UTC(), 12*time.Hour) {
+		return
+	}
+
+	privKeyPEM, csrPEM, err := identity.GenerateKeyAndCSR(id.AgentID)
+	if err != nil {
+		logger.Printf("certificate renewal CSR generation failed: %v", err)
+		return
+	}
+
+	renewed, err := apiClient.RenewCertificate(ctx, id, csrPEM)
+	if err != nil {
+		logger.Printf("certificate renewal request failed: %v", err)
+		return
+	}
+
+	caPEM := renewed.CACertPEM
+	if strings.TrimSpace(caPEM) == "" && id.CACertPath != "" {
+		if existingCA, readErr := os.ReadFile(id.CACertPath); readErr == nil {
+			caPEM = string(existingCA)
+		}
+	}
+
+	pkiDir := filepath.Dir(identityPath)
+	keyPath, certPath, caPath, err := identity.SaveMTLSFiles(pkiDir, privKeyPEM, renewed.ClientCertPEM, caPEM)
+	if err != nil {
+		logger.Printf("failed to save renewed mTLS certificate files: %v", err)
+		return
+	}
+
+	id.ClientKeyPath = keyPath
+	id.ClientCertPath = certPath
+	id.CACertPath = caPath
+	id.CertSerial = renewed.CertSerial
+	id.CertFingerprintSHA256 = renewed.CertFingerprintSHA256
+	id.CertSANURI = renewed.CertSANURI
+	id.CertNotBefore = renewed.CertNotBefore
+	id.CertNotAfter = renewed.CertNotAfter
+
+	if err := identity.Save(identityPath, id); err != nil {
+		logger.Printf("failed to save updated identity metadata: %v", err)
+		return
+	}
+	if err := apiClient.ConfigureMTLS(id); err != nil {
+		logger.Printf("failed to reload mTLS client configuration: %v", err)
+		return
+	}
+	logger.Printf("renewed mTLS client certificate for agent_id=%s serial=%s", id.AgentID, id.CertSerial)
 }
 
 func runAgentLoop(
@@ -200,6 +322,7 @@ func runAgentLoop(
 	apiClient *client.Client,
 	collector *system.Collector,
 	id *identity.Identity,
+	identityPath string,
 	heartbeatInterval time.Duration,
 ) error {
 	if heartbeatInterval <= 0 {
@@ -210,6 +333,8 @@ func runAgentLoop(
 	sentInitialSystemInfo := false
 
 	syncOnce := func() error {
+		maybeRenewCertificate(ctx, logger, apiClient, id, identityPath)
+
 		info := collector.Collect()
 
 		// Authenticate & send heartbeat

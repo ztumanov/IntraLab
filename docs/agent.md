@@ -161,11 +161,14 @@ Unit-файл настроен на запуск после `network-online.targ
 
 | Метод | Endpoint | Назначение |
 | :--- | :--- | :--- |
-| `POST` | `/api/agents/enroll` | Обмен одноразового токена на постоянный `agent_id` и `credential` |
-| `POST` | `/api/agents/heartbeat` | Обновление `last_seen_at` и статуса сервера (требует `Authorization: Bearer <credential>` и `X-Agent-ID`) |
-| `POST` | `/api/agents/system-info` | Сохранение информации о хосте (`hostname`, `os_distribution`, `kernel`, `architecture`, `cpu_count`, `ram_total_bytes`, `uptime_seconds`) |
-| `GET` | `/api/servers/:id/agent` | Получение статуса агента (`ONLINE` / `OFFLINE` / `NOT INSTALLED`), метаданных и одноразового токена (если агент ещё не установлен) |
+| `GET` | `/api/agents/ca.crt` | Публичный сертификат внутреннего корневого УЦ **InfraLab Agent Root CA** (PEM) |
+| `POST` | `/api/agents/enroll` | Одноразовая регистрация по токену + подпись локально сгенерированного CSR (`csr_pem`) с выпуском индивидуального X.509 сертификата (`spiffe://infralab/agent/<agent_id>`) |
+| `POST` | `/api/agents/renew` | Автоматическое продление (ротация) клиентского X.509 сертификата по действующему mTLS-соединению |
+| `POST` | `/api/agents/heartbeat` | Обновление `last_seen_at` и статуса сервера по взаимному mTLS X.509 сертификату (`spiffe://infralab/agent/<agent_id>`) |
+| `POST` | `/api/agents/system-info` | Сохранение информации о хосте (`hostname`, `os_distribution`, `kernel`, `architecture`, `cpu_count`, `ram_total_bytes`, `uptime_seconds`) по mTLS |
+| `GET` | `/api/servers/:id/agent` | Получение статуса агента (`ONLINE` / `OFFLINE` / `NOT INSTALLED`), метаданных X.509 сертификата и одноразового токена |
 | `POST` | `/api/servers/:id/agent/token` | Перевыпуск одноразового токена регистрации для сервера |
+| `POST` | `/api/servers/:id/agent/revoke` | Немедленный отзыв клиентского X.509 сертификата агента (`cert_revoked_at`) |
 | `GET` | `/api/prometheus/targets` | Динамическое обнаружение зарегистрированных агентов для Prometheus (`http_sd_configs`) |
 | `GET` | `/api/servers/:id/metrics?range=1h\|6h\|24h\|7d` | Выполнение PromQL-запросов к Prometheus для страницы `/servers/:id/monitoring` |
 

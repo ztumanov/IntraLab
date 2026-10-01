@@ -3,8 +3,15 @@ import { eq } from 'drizzle-orm';
 import { db } from './index.ts';
 import { agents, servers } from './schema.ts';
 import { decryptSecret, encryptSecret } from '../server/sshConnector.ts';
+import {
+  type AgentCaBundle,
+  generateAgentKeyPairAndCsrPem,
+  signAgentCsr,
+  verifyClientCertAgainstCa,
+} from '../server/agentPki.ts';
 
 export type AgentStatusState = 'ONLINE' | 'OFFLINE' | 'NOT INSTALLED';
+export type AgentAuthMode = 'mtls' | 'bearer';
 
 export interface ServerAgentView {
   server_id: number;
@@ -18,6 +25,15 @@ export interface ServerAgentView {
   cpu_count: number;
   ram_total_bytes: number;
   uptime_seconds: number;
+  auth_mode: AgentAuthMode;
+  cert_serial: string;
+  cert_fingerprint_sha256: string;
+  cert_subject: string;
+  cert_san_uri: string;
+  cert_not_before: string | null;
+  cert_not_after: string | null;
+  cert_revoked_at: string | null;
+  cert_revocation_reason: string;
   last_seen_at: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -45,12 +61,13 @@ export function generateAgentCredential(): string {
 export function computeAgentStatus(
   agentId: string,
   lastSeenAt: Date | null,
-  version?: string | null
+  version?: string | null,
+  certRevokedAt?: Date | null
 ): AgentStatusState {
   if (!agentId || agentId.trim() === '') {
     return 'NOT INSTALLED';
   }
-  if (version === 'stopped' || !lastSeenAt) {
+  if (version === 'stopped' || certRevokedAt || !lastSeenAt) {
     return 'OFFLINE';
   }
   const ageMs = Date.now() - lastSeenAt.getTime();
@@ -77,6 +94,7 @@ export async function getOrProvisionServerAgent(serverId: number): Promise<Serve
         enrollmentTokenHash: sha256Hex(token),
         enrollmentTokenEncrypted: encryptSecret(token),
         credentialHash: '',
+        authMode: 'mtls',
       })
       .returning();
     row = inserted[0];
@@ -94,7 +112,12 @@ export async function getOrProvisionServerAgent(serverId: number): Promise<Serve
     row = updated[0];
   }
 
-  const status = computeAgentStatus(row.agentId, row.lastSeenAt, row.version);
+  const status = computeAgentStatus(
+    row.agentId,
+    row.lastSeenAt,
+    row.version,
+    row.certRevokedAt
+  );
   const view: ServerAgentView = {
     server_id: row.serverId,
     status,
@@ -107,6 +130,15 @@ export async function getOrProvisionServerAgent(serverId: number): Promise<Serve
     cpu_count: row.cpuCount,
     ram_total_bytes: Number(row.ramTotalBytes || '0'),
     uptime_seconds: row.uptimeSeconds,
+    auth_mode: row.authMode === 'mtls' ? 'mtls' : 'bearer',
+    cert_serial: row.certSerial || '',
+    cert_fingerprint_sha256: row.certFingerprintSha256 || '',
+    cert_subject: row.certSubject || '',
+    cert_san_uri: row.certSanUri || '',
+    cert_not_before: row.certNotBefore ? row.certNotBefore.toISOString() : null,
+    cert_not_after: row.certNotAfter ? row.certNotAfter.toISOString() : null,
+    cert_revoked_at: row.certRevokedAt ? row.certRevokedAt.toISOString() : null,
+    cert_revocation_reason: row.certRevocationReason || '',
     last_seen_at: row.lastSeenAt ? row.lastSeenAt.toISOString() : null,
     created_at: row.createdAt ? row.createdAt.toISOString() : null,
     updated_at: row.updatedAt ? row.updatedAt.toISOString() : null,
@@ -158,6 +190,7 @@ export async function rotateServerEnrollmentToken(serverId: number): Promise<Ser
       enrollmentTokenHash: sha256Hex(token),
       enrollmentTokenEncrypted: encryptSecret(token),
       credentialHash: '',
+      authMode: 'mtls',
     });
   } else {
     await db
@@ -168,6 +201,15 @@ export async function rotateServerEnrollmentToken(serverId: number): Promise<Ser
         enrollmentTokenHash: sha256Hex(token),
         enrollmentTokenEncrypted: encryptSecret(token),
         credentialHash: '',
+        authMode: 'mtls',
+        certSerial: '',
+        certFingerprintSha256: '',
+        certSubject: '',
+        certSanUri: '',
+        certNotBefore: null,
+        certNotAfter: null,
+        certRevokedAt: null,
+        certRevocationReason: '',
         lastSeenAt: null,
         updatedAt: new Date(),
       })
@@ -177,15 +219,28 @@ export async function rotateServerEnrollmentToken(serverId: number): Promise<Ser
   return getOrProvisionServerAgent(serverId);
 }
 
+export interface EnrolledAgentResult {
+  agentId: string;
+  credential: string;
+  serverId: number;
+  authMode: AgentAuthMode;
+  clientCertPem?: string;
+  caCertPem?: string;
+  certSerial?: string;
+  certFingerprintSha256?: string;
+  certSanUri?: string;
+  certNotBefore?: string;
+  certNotAfter?: string;
+}
+
 export async function enrollAgentWithToken(params: {
   token: string;
   hostname: string;
   version: string;
-}): Promise<{
-  agentId: string;
-  credential: string;
-  serverId: number;
-} | null> {
+  csrPem?: string;
+  ttlHours?: number;
+  caBundle?: AgentCaBundle;
+}): Promise<EnrolledAgentResult | null> {
   const cleanToken = (params.token || '').trim();
   if (!cleanToken) return null;
 
@@ -201,9 +256,70 @@ export async function enrollAgentWithToken(params: {
   }
 
   const newAgentId = generateAgentId();
+  const now = new Date();
+  const cleanCsrPem = (params.csrPem || '').trim();
+
+  if (cleanCsrPem) {
+    // mTLS CSR-based enrollment: sign CSR with InfraLab Root CA
+    const signed = signAgentCsr({
+      csrPem: cleanCsrPem,
+      agentId: newAgentId,
+      ttlHours: params.ttlHours,
+      caBundle: params.caBundle,
+    });
+
+    await db
+      .update(agents)
+      .set({
+        agentId: newAgentId,
+        version: (params.version || '0.2.0').trim(),
+        hostname: (params.hostname || '').trim(),
+        // One-time token is invalidated immediately upon enrollment
+        enrollmentTokenHash: '',
+        enrollmentTokenEncrypted: '',
+        credentialHash: '',
+        authMode: 'mtls',
+        certSerial: signed.serialHex,
+        certFingerprintSha256: signed.fingerprintSha256,
+        certSubject: signed.subject,
+        certSanUri: signed.sanUri,
+        certNotBefore: signed.notBefore,
+        certNotAfter: signed.notAfter,
+        certRevokedAt: null,
+        certRevocationReason: '',
+        lastSeenAt: now,
+        updatedAt: now,
+      })
+      .where(eq(agents.id, row.id));
+
+    await db
+      .update(servers)
+      .set({
+        status: 'online',
+        lastCheckError: '',
+        lastCheckedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(servers.id, row.serverId));
+
+    return {
+      agentId: newAgentId,
+      credential: '',
+      serverId: row.serverId,
+      authMode: 'mtls',
+      clientCertPem: signed.clientCertPem,
+      caCertPem: signed.caCertPem,
+      certSerial: signed.serialHex,
+      certFingerprintSha256: signed.fingerprintSha256,
+      certSanUri: signed.sanUri,
+      certNotBefore: signed.notBefore.toISOString(),
+      certNotAfter: signed.notAfter.toISOString(),
+    };
+  }
+
+  // Legacy Bearer enrollment fallback for transitional migration compatibility
   const plainCredential = generateAgentCredential();
   const credHash = sha256Hex(plainCredential);
-  const now = new Date();
 
   await db
     .update(agents)
@@ -215,6 +331,15 @@ export async function enrollAgentWithToken(params: {
       enrollmentTokenHash: '',
       enrollmentTokenEncrypted: '',
       credentialHash: credHash,
+      authMode: 'bearer',
+      certSerial: '',
+      certFingerprintSha256: '',
+      certSubject: '',
+      certSanUri: '',
+      certNotBefore: null,
+      certNotAfter: null,
+      certRevokedAt: null,
+      certRevocationReason: '',
       lastSeenAt: now,
       updatedAt: now,
     })
@@ -234,6 +359,7 @@ export async function enrollAgentWithToken(params: {
     agentId: newAgentId,
     credential: plainCredential,
     serverId: row.serverId,
+    authMode: 'bearer',
   };
 }
 
@@ -241,9 +367,19 @@ export async function provisionAgentDirectlyForServer(params: {
   serverId: number;
   hostname: string;
   version?: string;
+  csrPem?: string;
+  ttlHours?: number;
+  caBundle?: AgentCaBundle;
 }): Promise<{
   agentId: string;
   credential: string;
+  authMode: AgentAuthMode;
+  clientCertPem: string;
+  clientKeyPem: string;
+  caCertPem: string;
+  certSerial: string;
+  certFingerprintSha256: string;
+  certNotAfter: string;
 }> {
   const existing = await db
     .select()
@@ -252,11 +388,24 @@ export async function provisionAgentDirectlyForServer(params: {
 
   const existingAgentId = existing[0]?.agentId?.trim();
   const newAgentId = existingAgentId ? existingAgentId : generateAgentId();
-  const plainCredential = generateAgentCredential();
-  const credHash = sha256Hex(plainCredential);
   const now = new Date();
   const version = (params.version || '0.2.0').trim();
   const hostname = (params.hostname || '').trim();
+
+  let privateKeyPem = '';
+  let csrPem = (params.csrPem || '').trim();
+  if (!csrPem) {
+    const generated = generateAgentKeyPairAndCsrPem(newAgentId);
+    privateKeyPem = generated.privateKeyPem;
+    csrPem = generated.csrPem;
+  }
+
+  const signed = signAgentCsr({
+    csrPem,
+    agentId: newAgentId,
+    ttlHours: params.ttlHours,
+    caBundle: params.caBundle,
+  });
 
   if (existing.length === 0) {
     await db.insert(agents).values({
@@ -266,7 +415,16 @@ export async function provisionAgentDirectlyForServer(params: {
       hostname,
       enrollmentTokenHash: '',
       enrollmentTokenEncrypted: '',
-      credentialHash: credHash,
+      credentialHash: '',
+      authMode: 'mtls',
+      certSerial: signed.serialHex,
+      certFingerprintSha256: signed.fingerprintSha256,
+      certSubject: signed.subject,
+      certSanUri: signed.sanUri,
+      certNotBefore: signed.notBefore,
+      certNotAfter: signed.notAfter,
+      certRevokedAt: null,
+      certRevocationReason: '',
       lastSeenAt: now,
       updatedAt: now,
     });
@@ -279,7 +437,16 @@ export async function provisionAgentDirectlyForServer(params: {
         hostname,
         enrollmentTokenHash: '',
         enrollmentTokenEncrypted: '',
-        credentialHash: credHash,
+        credentialHash: '',
+        authMode: 'mtls',
+        certSerial: signed.serialHex,
+        certFingerprintSha256: signed.fingerprintSha256,
+        certSubject: signed.subject,
+        certSanUri: signed.sanUri,
+        certNotBefore: signed.notBefore,
+        certNotAfter: signed.notAfter,
+        certRevokedAt: null,
+        certRevocationReason: '',
         lastSeenAt: now,
         updatedAt: now,
       })
@@ -298,8 +465,194 @@ export async function provisionAgentDirectlyForServer(params: {
 
   return {
     agentId: newAgentId,
-    credential: plainCredential,
+    credential: '',
+    authMode: 'mtls',
+    clientCertPem: signed.clientCertPem,
+    clientKeyPem: privateKeyPem,
+    caCertPem: signed.caCertPem,
+    certSerial: signed.serialHex,
+    certFingerprintSha256: signed.fingerprintSha256,
+    certNotAfter: signed.notAfter.toISOString(),
   };
+}
+
+export async function verifyAgentMtlsCertificate(params: {
+  clientCertPemOrDer: string | Buffer;
+  headerAgentId?: string;
+  claimedAgentIds?: string[];
+  caBundle?: AgentCaBundle;
+  now?: Date;
+}): Promise<{
+  id: number;
+  serverId: number;
+  agentId: string;
+  authMode: 'mtls';
+  certSerial: string;
+  certFingerprintSha256: string;
+} | null> {
+  try {
+    const verifiedCert = verifyClientCertAgainstCa(
+      params.clientCertPemOrDer,
+      params.caBundle,
+      params.now
+    );
+
+    const allClaims: string[] = [];
+    if (params.headerAgentId && params.headerAgentId.trim()) {
+      allClaims.push(params.headerAgentId.trim());
+    }
+    if (Array.isArray(params.claimedAgentIds)) {
+      for (const claim of params.claimedAgentIds) {
+        if (typeof claim === 'string' && claim.trim()) {
+          allClaims.push(claim.trim());
+        }
+      }
+    }
+
+    for (const claimedId of allClaims) {
+      if (claimedId !== verifiedCert.agentId) {
+        // Prevent X-Agent-ID / body agent_id / query agent_id spoofing:
+        // every supplied agent_id must match the SPIFFE URI identity in the X.509 certificate
+        return null;
+      }
+    }
+
+    const rows = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.agentId, verifiedCert.agentId));
+
+    const row = rows[0];
+    if (!row) return null;
+
+    // Reject revoked certificates
+    if (row.certRevokedAt) {
+      return null;
+    }
+
+    // Require stored fingerprint and serial to match active issued certificate
+    if (!row.certFingerprintSha256 || !row.certSerial) {
+      return null;
+    }
+
+    const expectedFp = Buffer.from(row.certFingerprintSha256.toLowerCase(), 'utf8');
+    const actualFp = Buffer.from(verifiedCert.fingerprintSha256.toLowerCase(), 'utf8');
+    if (
+      expectedFp.length !== actualFp.length ||
+      !crypto.timingSafeEqual(expectedFp, actualFp)
+    ) {
+      return null;
+    }
+
+    if (row.certSerial.toUpperCase() !== verifiedCert.serialHex.toUpperCase()) {
+      return null;
+    }
+
+    const checkNow = params.now || new Date();
+    if (row.certNotAfter && checkNow.getTime() > row.certNotAfter.getTime()) {
+      return null;
+    }
+
+    return {
+      id: row.id,
+      serverId: row.serverId,
+      agentId: row.agentId,
+      authMode: 'mtls',
+      certSerial: verifiedCert.serialHex,
+      certFingerprintSha256: verifiedCert.fingerprintSha256,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function renewAgentCertificate(params: {
+  agentId: string;
+  csrPem: string;
+  ttlHours?: number;
+  caBundle?: AgentCaBundle;
+}): Promise<{
+  agentId: string;
+  serverId: number;
+  clientCertPem: string;
+  caCertPem: string;
+  certSerial: string;
+  certFingerprintSha256: string;
+  certSanUri: string;
+  certNotBefore: string;
+  certNotAfter: string;
+} | null> {
+  const cleanAgentId = (params.agentId || '').trim();
+  const cleanCsrPem = (params.csrPem || '').trim();
+  if (!cleanAgentId || !cleanCsrPem) return null;
+
+  const rows = await db
+    .select()
+    .from(agents)
+    .where(eq(agents.agentId, cleanAgentId));
+
+  const row = rows[0];
+  if (!row || row.certRevokedAt) {
+    return null;
+  }
+
+  const signed = signAgentCsr({
+    csrPem: cleanCsrPem,
+    agentId: cleanAgentId,
+    ttlHours: params.ttlHours,
+    caBundle: params.caBundle,
+  });
+
+  const now = new Date();
+  await db
+    .update(agents)
+    .set({
+      authMode: 'mtls',
+      credentialHash: '',
+      certSerial: signed.serialHex,
+      certFingerprintSha256: signed.fingerprintSha256,
+      certSubject: signed.subject,
+      certSanUri: signed.sanUri,
+      certNotBefore: signed.notBefore,
+      certNotAfter: signed.notAfter,
+      certRevokedAt: null,
+      certRevocationReason: '',
+      lastSeenAt: now,
+      updatedAt: now,
+    })
+    .where(eq(agents.id, row.id));
+
+  return {
+    agentId: cleanAgentId,
+    serverId: row.serverId,
+    clientCertPem: signed.clientCertPem,
+    caCertPem: signed.caCertPem,
+    certSerial: signed.serialHex,
+    certFingerprintSha256: signed.fingerprintSha256,
+    certSanUri: signed.sanUri,
+    certNotBefore: signed.notBefore.toISOString(),
+    certNotAfter: signed.notAfter.toISOString(),
+  };
+}
+
+export async function revokeServerAgentCertificate(
+  serverId: number,
+  reason = 'revoked_by_operator'
+): Promise<ServerAgentView> {
+  const now = new Date();
+  await db
+    .update(agents)
+    .set({
+      credentialHash: '',
+      certRevokedAt: now,
+      certRevocationReason: (reason || 'revoked_by_operator').trim(),
+      version: 'stopped',
+      lastSeenAt: null,
+      updatedAt: now,
+    })
+    .where(eq(agents.serverId, serverId));
+
+  return getOrProvisionServerAgent(serverId);
 }
 
 export async function verifyAgentCredential(
@@ -317,6 +670,12 @@ export async function verifyAgentCredential(
 
   const row = rows[0];
   if (!row || !row.credentialHash) return null;
+
+  // Reject if certificate was revoked or if agent is enrolled in mTLS mode
+  if (row.certRevokedAt) return null;
+  if (row.authMode === 'mtls' && process.env.AGENT_ALLOW_LEGACY_BEARER !== 'true') {
+    return null;
+  }
 
   const providedHash = sha256Hex(cleanCred);
   const a = Buffer.from(providedHash, 'utf8');
@@ -343,7 +702,7 @@ export async function recordAgentHeartbeat(params: {
     .select()
     .from(agents)
     .where(eq(agents.agentId, params.agentId));
-  if (currentRows[0]?.version === 'stopped') {
+  if (currentRows[0]?.version === 'stopped' || currentRows[0]?.certRevokedAt) {
     return now;
   }
 
@@ -410,7 +769,7 @@ export async function recordAgentSystemInfo(params: {
     .select()
     .from(agents)
     .where(eq(agents.agentId, params.agentId));
-  if (currentRows[0]?.version === 'stopped') {
+  if (currentRows[0]?.version === 'stopped' || currentRows[0]?.certRevokedAt) {
     return now;
   }
 
@@ -495,6 +854,7 @@ export async function listPrometheusAgentTargets(
       serverId: agents.serverId,
       agentId: agents.agentId,
       version: agents.version,
+      certRevokedAt: agents.certRevokedAt,
       agentHostname: agents.hostname,
       serverHostname: servers.hostname,
       serverName: servers.name,
@@ -505,7 +865,7 @@ export async function listPrometheusAgentTargets(
 
   const targets: PrometheusTargetGroup[] = [];
   for (const row of rows) {
-    if (!row.agentId || !row.agentId.trim() || row.version === 'stopped') {
+    if (!row.agentId || !row.agentId.trim() || row.version === 'stopped' || row.certRevokedAt) {
       continue;
     }
     const host = (row.ipAddress || row.serverHostname || '').trim();

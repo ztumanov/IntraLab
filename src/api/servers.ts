@@ -418,6 +418,27 @@ export async function stopServerAgentViaSsh(id: number): Promise<ServerAgentInfo
   return response.json();
 }
 
+export async function revokeServerAgentCert(
+  id: number,
+  reason = 'revoked_by_operator'
+): Promise<ServerAgentInfo> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`/api/servers/${id}/agent/revoke`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ reason }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new ApiRequestError(
+      body.error || 'Failed to revoke agent certificate',
+      response.status,
+      body.details
+    );
+  }
+  return response.json();
+}
+
 export async function fetchServerMonitoring(
   id: number,
   range: MonitoringTimeRange = '1h',

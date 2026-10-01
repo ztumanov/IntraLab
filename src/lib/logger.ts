@@ -13,12 +13,13 @@ export interface StructuredLogFields {
 }
 
 const SENSITIVE_KEY_PATTERN =
-  /password|secret|private_?key|token|authorization|cookie|credential|totp/i;
+  /password|secret|private_?key|ca_?key|token|authorization|cookie|credential|totp/i;
 
 export function redactSensitiveString(input: string): string {
   if (!input) return input;
   return input
     .replace(/ila_enroll_[a-zA-Z0-9_-]+/g, 'ila_enroll_[REDACTED]')
+    .replace(/ila_cred_[a-zA-Z0-9_-]+/g, 'ila_cred_[REDACTED]')
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
     .replace(
       /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,

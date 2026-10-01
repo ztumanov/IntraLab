@@ -96,10 +96,32 @@ CREATE TABLE IF NOT EXISTS agents (
   enrollment_token_hash TEXT NOT NULL DEFAULT '',
   enrollment_token_encrypted TEXT NOT NULL DEFAULT '',
   credential_hash TEXT NOT NULL DEFAULT '',
+  auth_mode TEXT NOT NULL DEFAULT 'bearer',
+  cert_serial TEXT NOT NULL DEFAULT '',
+  cert_fingerprint_sha256 TEXT NOT NULL DEFAULT '',
+  cert_subject TEXT NOT NULL DEFAULT '',
+  cert_san_uri TEXT NOT NULL DEFAULT '',
+  cert_not_before TIMESTAMP,
+  cert_not_after TIMESTAMP,
+  cert_revoked_at TIMESTAMP,
+  cert_revocation_reason TEXT NOT NULL DEFAULT '',
   last_seen_at TIMESTAMP,
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS auth_mode TEXT NOT NULL DEFAULT 'bearer';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_serial TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_fingerprint_sha256 TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_subject TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_san_uri TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_not_before TIMESTAMP;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_not_after TIMESTAMP;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_revoked_at TIMESTAMP;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_revocation_reason TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_agents_cert_fingerprint ON agents(cert_fingerprint_sha256);
+CREATE INDEX IF NOT EXISTS idx_agents_cert_serial ON agents(cert_serial);
 `;
 
 export const DEFAULT_LOCAL_ADMIN_UID = 'infralab-local-operator';

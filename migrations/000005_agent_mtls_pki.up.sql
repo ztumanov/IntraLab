@@ -1,0 +1,12 @@
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS auth_mode TEXT NOT NULL DEFAULT 'bearer';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_serial TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_fingerprint_sha256 TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_subject TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_san_uri TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_not_before TIMESTAMP;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_not_after TIMESTAMP;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_revoked_at TIMESTAMP;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cert_revocation_reason TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_agents_cert_fingerprint ON agents(cert_fingerprint_sha256);
+CREATE INDEX IF NOT EXISTS idx_agents_cert_serial ON agents(cert_serial);

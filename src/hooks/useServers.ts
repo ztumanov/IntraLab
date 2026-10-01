@@ -22,6 +22,7 @@ import {
   installServerAgentViaSsh,
   launchDockerContainer,
   readSftpFile,
+  revokeServerAgentCert,
   rotateServerAgentToken,
   stopServerAgentViaSsh,
   triggerDockerContainerAction,
@@ -117,6 +118,17 @@ export function useStopServerAgentViaSsh() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: number) => stopServerAgentViaSsh(id),
+    onSuccess: (updated, id) => {
+      queryClient.setQueryData(['servers', id, 'agent'], updated);
+      queryClient.invalidateQueries({ queryKey: ['servers', id, 'monitoring'] });
+    },
+  });
+}
+
+export function useRevokeServerAgentCert() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => revokeServerAgentCert(id),
     onSuccess: (updated, id) => {
       queryClient.setQueryData(['servers', id, 'agent'], updated);
       queryClient.invalidateQueries({ queryKey: ['servers', id, 'monitoring'] });
