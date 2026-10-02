@@ -314,6 +314,31 @@ export async function fetchServerSystemLogs(
   return response.json();
 }
 
+export async function buildServerLogStreamUrl(params: {
+  serverId: number;
+  source: SystemLogSource | 'journal';
+  unit?: string;
+  container?: string;
+  tail?: number;
+}): Promise<string> {
+  const token = await getInMemoryAuthToken();
+  const search = new URLSearchParams();
+  search.set('source', params.source);
+  if (params.unit && params.unit.trim()) {
+    search.set('unit', params.unit.trim());
+  }
+  if (params.container && params.container.trim()) {
+    search.set('container', params.container.trim());
+  }
+  if (params.tail) {
+    search.set('tail', String(params.tail));
+  }
+  if (token) {
+    search.set('token', token);
+  }
+  return `/api/servers/${params.serverId}/logs/stream?${search.toString()}`;
+}
+
 export async function executeSshCommandOnServer(
   id: number,
   command: string

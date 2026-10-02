@@ -28,11 +28,12 @@ import {
   useServerDocker,
   useServers,
 } from '../hooks/useServers.ts';
-import { fetchDockerLogs } from '../api/servers.ts';
+import { buildServerLogStreamUrl, fetchDockerLogs } from '../api/servers.ts';
 import {
   DockerContainerAction,
   DockerContainerInfo,
   DockerRunContainerInput,
+  RealTimeLogEvent,
 } from '../types/server.ts';
 import { useI18n } from '../context/I18nContext.tsx';
 
@@ -68,6 +69,7 @@ export const ContainersPage: React.FC = () => {
   const [isLoadingLogs, setIsLoadingLogs] = useState<boolean>(false);
   const [logTailLines, setLogTailLines] = useState<number>(120);
   const [copiedLogs, setCopiedLogs] = useState<boolean>(false);
+  const [liveContainerStream, setLiveContainerStream] = useState<boolean>(true);
 
   // Run new container modal state
   const [isRunModalOpen, setIsRunModalOpen] = useState<boolean>(false);
@@ -172,6 +174,58 @@ export const ContainersPage: React.FC = () => {
       // Ignore clipboard error
     }
   };
+
+  useEffect(() => {
+    const serverId = selectedServer?.id || 0;
+    const containerTarget = inspectedContainer?.name || inspectedContainer?.id || '';
+    if (!serverId || !containerTarget || !liveContainerStream) {
+      return;
+    }
+
+    let es: EventSource | null = null;
+    let cancelled = false;
+
+    const startStream = async () => {
+      try {
+        const url = await buildServerLogStreamUrl({
+          serverId,
+          source: 'docker',
+          container: containerTarget,
+          tail: logTailLines,
+        });
+        if (cancelled) return;
+        es = new EventSource(url);
+        es.addEventListener('log', (evt: MessageEvent) => {
+          if (cancelled) return;
+          try {
+            const ev = JSON.parse(evt.data) as RealTimeLogEvent;
+            const formatted = `${ev.timestamp} ${ev.message}`;
+            setContainerLogsText((prev) => {
+              const base =
+                prev && !prev.startsWith('Логи контейнера пусты')
+                  ? prev.split('\n').slice(-499)
+                  : [];
+              if (base[base.length - 1] === formatted) return prev;
+              return [...base, formatted].join('\n');
+            });
+          } catch {
+            // Ignore malformed event
+          }
+        });
+      } catch {
+        // Ignore URL construction error
+      }
+    };
+
+    void startStream();
+
+    return () => {
+      cancelled = true;
+      if (es) {
+        es.close();
+      }
+    };
+  }, [selectedServer?.id, inspectedContainer?.id, inspectedContainer?.name, liveContainerStream, logTailLines]);
 
   const handleLaunchContainer = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -879,6 +933,27 @@ export const ContainersPage: React.FC = () => {
                         </button>
                       ))}
                     </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setLiveContainerStream((s) => !s)}
+                      className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs font-medium ${
+                        liveContainerStream
+                          ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                          : 'border-slate-700 bg-[#1E293B] text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      <Activity
+                        className={`h-3 w-3 ${
+                          liveContainerStream ? 'text-emerald-400 animate-pulse' : 'text-slate-400'
+                        }`}
+                      />
+                      <span>
+                        {liveContainerStream
+                          ? t('Live (SSE)', 'Live (SSE)')
+                          : t('Live: ВЫКЛ', 'Live: OFF')}
+                      </span>
+                    </button>
 
                     <button
                       type="button"

@@ -21,6 +21,7 @@ import (
 	"github.com/infralab/infralab/agent/internal/client"
 	"github.com/infralab/infralab/agent/internal/config"
 	"github.com/infralab/infralab/agent/internal/identity"
+	"github.com/infralab/infralab/agent/internal/logstream"
 	"github.com/infralab/infralab/agent/internal/metrics"
 	"github.com/infralab/infralab/agent/internal/system"
 )
@@ -251,6 +252,10 @@ func runDaemonCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		defer cancel()
 		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
+
+	// Start persistent mTLS log streaming control & event session
+	streamSession := logstream.NewAgentStreamSession(cfg.ServerURL, id, nil, logger)
+	go streamSession.RunLoop(ctx)
 
 	logger.Printf("starting daemon v%s for agent_id=%s auth_mode=%s server=%s", Version, id.AgentID, id.AuthMode, cfg.ServerURL)
 	return runAgentLoop(ctx, logger, apiClient, collector, id, *identityPath, cfg.HeartbeatInterval())

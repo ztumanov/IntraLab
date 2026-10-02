@@ -129,10 +129,12 @@ InfraLab — это централизованная self-hosted система 
 * Инспекция сетевых интерфейсов (`ip addr`), открытых сокетов и слушающих портов TCP/UDP (`ss -tulnp`), таблицы маршрутизации ядра (`ip route`), конфигурации DNS и статуса межсетевого экрана.
 * Автоматическое определение географического положения серверов по их публичным IP-адресам (`GET /api/servers/geolocation`) и отображение узлов на интерактивной карте с цветовой индикацией статуса и задержки.
 
-### 7. Интерактивный WebSocket PTY-терминал, системные журналы и оповещения (`/servers/:id`, `/logs`, `/deployments`, `/alerts`)
+### 7. Интерактивный WebSocket PTY-терминал, потоковая передача логов (Real-Time Log Streaming) и оповещения (`/servers/:id`, `/logs`, `/deployments`, `/alerts`)
 * Полноценный интерактивный потоковый псевдотерминал в браузере (**WebSocket PTY Terminal** на базе `@xterm/xterm` + `ssh2.shell` с поддержкой `xterm-256color`, автоматическим изменением размера окна `cols`/`rows`, управляющих последовательностей `Ctrl+C`, автодополнения `Tab` и быстрых команд).
+* **Потоковая передача логов в реальном времени (Real-Time Log Streaming без polling):**
+  * Цепочка доставки: `Linux server (journalctl -f / docker logs --follow)` $\rightarrow$ `infralab-agent` (безопасный запуск через `exec.CommandContext` без shell-интерполяции и с валидацией имён юнитов/контейнеров) $\rightarrow$ постоянный двунаправленный канал **mTLS WebSocket** (`/api/agents/logs/ws`) $\rightarrow$ **InfraLab LogStreamHub** (дедупликация подписок, кольцевой буфер, защита от backpressure и автоматическая отправка `stop_stream` при закрытии последней вкладки) $\rightarrow$ **Server-Sent Events (SSE)** (`GET /api/servers/:id/logs/stream`) $\rightarrow$ **React Frontend** (`EventSource` с поддержкой паузы, очистки буфера, автоскролла, выбора systemd-юнита или Docker-контейнера).
+  * Сохранена обратная совместимость со снимками истории логов по SSH (`GET /api/servers/:id/logs` и `GET /api/servers/:id/docker/containers/:containerId/logs`).
 * Пакетное выполнение произвольных команд в удалённой SSH-консоли с сохранением полного журнала аудита (`ssh_command_logs`: код возврата, длительность, `stdout`/`stderr`).
-* Чтение системных журналов Linux (`systemd-journald`, логов авторизации `/var/log/auth.log`, сообщений ядра `dmesg` и демона Docker) с фильтрацией по уровню критичности (`ERROR`, `WARN`, `INFO`) и поиском по тексту.
 * Модуль пакетного выполнения сценариев обслуживания (Deployments) и система пороговых правил оповещений (Alerts) по метрикам Disk, CPU, RAM, SSH Latency и доступности узла.
 
 ---
@@ -141,15 +143,13 @@ InfraLab — это централизованная self-hosted система 
 
 В следующих итерациях развития проекта запланирована реализация следующих подсистем:
 
-1. **Потоковая передача логов в реальном времени (Log Streaming):**
-   * Непрерывная доставка логов (`journalctl -f` и логов контейнеров) через SSE/WebSocket без периодического опроса.
-2. **Интеграция с внешними каналами уведомлений (Alertmanager / Webhooks):**
+1. **Интеграция с внешними каналами уведомлений (Alertmanager / Webhooks):**
    * Отправка сработавших триггеров из модуля Alerts в Telegram, Slack, Email (SMTP) и PagerDuty.
-3. **Автоматическое обновление агента (Agent Self-Update):**
+2. **Автоматическое обновление агента (Agent Self-Update):**
    * Централизованное обновление бинарного файла `infralab-agent` на всех управляемых серверах с проверкой криптографической подписи релиза (`SHA-256` / `Ed25519`).
-4. **Поддержка кластеров Kubernetes и systemd-сервисов:**
+3. **Поддержка кластеров Kubernetes и systemd-сервисов:**
    * Инспекция подов, узлов и пространств имён Kubernetes (`kubectl` / Kube API), а также управление системными службами `systemd` через веб-интерфейс.
-5. **Ролевая модель доступа (RBAC):**
+4. **Ролевая модель доступа (RBAC):**
    * Разграничение прав операторов (`Admin`, `Operator`, `Read-Only Auditor`) на уровне отдельных серверов и окружений.
 
 ---
@@ -164,6 +164,7 @@ InfraLab — это централизованная self-hosted система 
 │   │   ├── client/                 # mTLS HTTPS-клиент к API InfraLab, CSR enrollment, renew и backoff
 │   │   ├── config/                 # Конфигурация агента (/etc/infralab-agent/config.json)
 │   │   ├── identity/               # Генерация ECDSA P-256 + CSR, атомарное хранение PKI (0700 / 0600)
+│   │   ├── logstream/              # Потоковая передача логов (journalctl -f / docker logs --follow) по mTLS WS
 │   │   ├── metrics/                # Экспортер метрик Prometheus (GET /metrics)
 │   │   └── system/                 # Сбор метрик Linux из /proc и /etc без shell-вызовов
 │   ├── infralab-agent.service      # Unit-файл для systemd

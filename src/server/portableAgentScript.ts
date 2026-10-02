@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import ssl
@@ -26,6 +27,9 @@ VERSION = "0.2.0"
 DEFAULT_CONFIG_PATH = "/etc/infralab-agent/config.json"
 DEFAULT_CRED_PATH = "/var/lib/infralab-agent/credentials.json"
 DEFAULT_LISTEN_ADDR = ":9101"
+
+VALID_CONTAINER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+VALID_UNIT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,127}$")
 
 
 def write_atomic(path, content, mode=0o600):
@@ -398,6 +402,121 @@ def cmd_run(args):
 
     t = threading.Thread(target=heartbeat_worker, daemon=True)
     t.start()
+
+    active_procs = {}
+    procs_lock = threading.Lock()
+
+    def stop_proc(sid):
+        with procs_lock:
+            p = active_procs.pop(sid, None)
+        if p is not None:
+            try:
+                p.terminate()
+                p.wait(timeout=1.0)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+    def start_proc(cmd_obj, headers):
+        sid = str(cmd_obj.get("stream_id") or "default")
+        stop_proc(sid)
+        source = str(cmd_obj.get("source") or "journald").lower()
+        unit = str(cmd_obj.get("unit") or "").strip()
+        container_id = str(cmd_obj.get("container_id") or "").strip()
+        tail = max(10, min(500, int(cmd_obj.get("tail") or 50)))
+
+        if source == "docker" and container_id:
+            if not VALID_CONTAINER_RE.match(container_id):
+                return
+            argv = ["docker", "logs", "--follow", "--timestamps", "--tail", str(tail), container_id]
+            norm_source = "docker"
+        elif source == "auth":
+            argv = ["journalctl", "-u", "ssh", "-u", "sshd", "-n", str(tail), "-f", "--no-pager", "-o", "short-iso"]
+            norm_source = "journal"
+        elif source == "kernel":
+            argv = ["journalctl", "-k", "-n", str(tail), "-f", "--no-pager", "-o", "short-iso"]
+            norm_source = "journal"
+        elif source == "docker":
+            argv = ["journalctl", "-u", "docker", "-n", str(tail), "-f", "--no-pager", "-o", "short-iso"]
+            norm_source = "journal"
+        else:
+            if unit and not VALID_UNIT_RE.match(unit):
+                return
+            argv = ["journalctl"]
+            if unit:
+                argv.extend(["-u", unit])
+            argv.extend(["-n", str(tail), "-f", "--no-pager", "-o", "short-iso"])
+            norm_source = "journal"
+
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception:
+            return
+
+        with procs_lock:
+            active_procs[sid] = proc
+
+        def reader():
+            try:
+                for line in iter(proc.stdout.readline, ""):
+                    msg = line.rstrip("\\r\\n")
+                    if not msg:
+                        continue
+                    ssl_ctx = build_ssl_context(ca_cert_path, client_cert_path, client_key_path) if has_mtls else None
+                    post_json(
+                        f"{server_url}/api/agents/logs/events",
+                        {
+                            "stream_id": sid,
+                            "event": {
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "agent_id": agent_id,
+                                "source": norm_source,
+                                "container_id": container_id or None,
+                                "unit": unit or None,
+                                "stream": "stdout",
+                                "message": msg,
+                            },
+                        },
+                        headers=headers,
+                        ssl_ctx=ssl_ctx,
+                    )
+            except Exception:
+                pass
+            finally:
+                stop_proc(sid)
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    def log_poll_worker():
+        headers = {"X-Agent-ID": agent_id, "Accept": "application/json"}
+        if not has_mtls and credential:
+            headers["Authorization"] = f"Bearer {credential}"
+        while True:
+            try:
+                ssl_ctx = build_ssl_context(ca_cert_path, client_cert_path, client_key_path) if has_mtls else None
+                req = urllib.request.Request(f"{server_url}/api/agents/logs/poll", headers=headers, method="GET")
+                with urllib.request.urlopen(req, timeout=8, context=ssl_ctx) as resp:
+                    raw = resp.read().decode("utf-8")
+                    data = json.loads(raw) if raw else {}
+                    for c in data.get("commands", []):
+                        ctype = c.get("type")
+                        if ctype in ("start_stream", "change_source"):
+                            start_proc(c, headers)
+                        elif ctype in ("stop_stream", "disconnect_stream"):
+                            stop_proc(str(c.get("stream_id") or "default"))
+            except Exception:
+                pass
+            time.sleep(2)
+
+    threading.Thread(target=log_poll_worker, daemon=True).start()
 
     httpd = HTTPServer((host, port), MetricsHandler)
     print(f"[infralab-agent] serving Prometheus /metrics on http://{host}:{port}/metrics", flush=True)

@@ -182,6 +182,32 @@ export interface ServerLogsResponse {
   fetched_at: string;
 }
 
+export interface RealTimeLogEvent {
+  timestamp: string;
+  server_id: number;
+  agent_id?: string;
+  source: 'journal' | 'docker';
+  container_id?: string;
+  container_name?: string;
+  unit?: string;
+  stream?: 'stdout' | 'stderr';
+  level?: 'info' | 'warn' | 'error';
+  message: string;
+}
+
+export interface LogStreamStatusEvent {
+  status: 'connecting' | 'streaming' | 'waiting_for_agent' | 'reconnecting' | 'stopped' | 'error';
+  stream_id?: string;
+  server_id: number;
+  source?: string;
+  unit?: string;
+  container_id?: string;
+  transport?: 'agent_mtls' | 'agent_http' | 'ssh_shared';
+  agent_id?: string;
+  message?: string;
+  timestamp: string;
+}
+
 export interface ServerGeoLocation {
   server: Server;
   lat: number;

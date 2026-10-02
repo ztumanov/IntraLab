@@ -9,6 +9,15 @@ import { ensureDatabaseSchema } from './src/db/bootstrap.ts';
 import { logger } from './src/lib/logger.ts';
 import { attachTerminalWebSocketServer } from './src/server/wsTerminal.ts';
 import {
+  attachAgentLogStreamWebSocketServer,
+  logStreamHub,
+  validateContainerIdentifier,
+  validatePriorityFilter,
+  validateSinceFilter,
+  validateTailFilter,
+  validateUnitIdentifier,
+} from './src/server/logStreamHub.ts';
+import {
   listServersByUser,
   getServerById,
   createServerRecord,
@@ -1386,6 +1395,87 @@ export function createApp() {
     }
   });
 
+  app.get('/api/servers/:id/logs/stream', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid server ID' });
+      }
+
+      const server = await getServerById(id, uid);
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+
+      const rawSource = String(req.query.source || 'journald').trim().toLowerCase();
+      if (!['journal', 'journald', 'auth', 'kernel', 'docker'].includes(rawSource)) {
+        return res.status(400).json({ error: 'Invalid log source' });
+      }
+      const source = rawSource === 'journal' ? 'journald' : rawSource;
+
+      const unit = typeof req.query.unit === 'string' ? req.query.unit.trim() : '';
+      if (unit && !validateUnitIdentifier(unit)) {
+        return res.status(400).json({ error: 'Invalid systemd unit name' });
+      }
+
+      const priority = typeof req.query.priority === 'string' ? req.query.priority.trim() : '';
+      if (priority && !validatePriorityFilter(priority)) {
+        return res.status(400).json({ error: 'Invalid journal priority filter' });
+      }
+
+      const since = typeof req.query.since === 'string' ? req.query.since.trim() : '';
+      if (since && !validateSinceFilter(since)) {
+        return res.status(400).json({ error: 'Invalid since timestamp filter' });
+      }
+
+      const containerId =
+        typeof req.query.container === 'string'
+          ? req.query.container.trim()
+          : typeof req.query.container_id === 'string'
+            ? req.query.container_id.trim()
+            : '';
+      if (containerId && !validateContainerIdentifier(containerId)) {
+        return res.status(400).json({ error: 'Invalid Docker container identifier' });
+      }
+
+      const tailCheck = validateTailFilter(req.query.tail);
+      if (!tailCheck.valid) {
+        return res.status(400).json({ error: 'Invalid tail filter value' });
+      }
+      const tail = tailCheck.value;
+
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
+
+      const unsubscribe = logStreamHub.subscribeSseClient({
+        server,
+        source,
+        unit,
+        priority,
+        since,
+        containerId,
+        tail,
+        res,
+      });
+
+      req.on('close', unsubscribe);
+      res.on('close', unsubscribe);
+    } catch (error: any) {
+      console.error('GET /api/servers/:id/logs/stream failed:', error);
+      if (!res.headersSent) {
+        return res.status(500).json({ error: error.message || 'Failed to open log stream' });
+      }
+      res.end();
+    }
+  });
+
   app.post('/api/servers/:id/exec', requireAuth, async (req: AuthRequest, res) => {
     try {
       const uid = req.user!.uid;
@@ -1453,6 +1543,7 @@ export function createApp() {
       if (!deleted) {
         return res.status(404).json({ error: 'Server not found' });
       }
+      logStreamHub.disconnectServerAgent(id, 'server_deleted');
 
       return res.status(204).send();
     } catch (error: any) {
@@ -1842,6 +1933,46 @@ export function createApp() {
     }
   });
 
+  app.get('/api/agents/logs/poll', async (req, res) => {
+    try {
+      const verified = await authenticateAgentRequest(req);
+      if (!verified) {
+        return res.status(401).json({ error: 'Invalid or missing agent mTLS certificate or credential' });
+      }
+      const commands = logStreamHub.pollAgentControlCommands({
+        agentId: verified.agentId,
+        serverId: verified.serverId,
+        authMode: verified.authMode,
+      });
+      return res.status(200).json({
+        agent_id: verified.agentId,
+        server_id: verified.serverId,
+        commands,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message || 'Failed to poll agent log commands' });
+    }
+  });
+
+  app.post('/api/agents/logs/events', async (req, res) => {
+    try {
+      const verified = await authenticateAgentRequest(req);
+      if (!verified) {
+        return res.status(401).json({ error: 'Invalid or missing agent mTLS certificate or credential' });
+      }
+      const streamId = typeof req.body?.stream_id === 'string' ? req.body.stream_id.trim() : '';
+      const rawEvents = Array.isArray(req.body?.events)
+        ? req.body.events
+        : req.body?.event
+          ? [req.body.event]
+          : [];
+      logStreamHub.ingestAgentEvents(verified.serverId, verified.agentId, streamId, rawEvents);
+      return res.status(200).json({ status: 'ok', ingested: rawEvents.length });
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message || 'Failed to ingest agent log events' });
+    }
+  });
+
   app.get('/api/servers/:id/agent', requireAuth, async (req: AuthRequest, res) => {
     try {
       const uid = req.user!.uid;
@@ -2213,6 +2344,7 @@ WantedBy=multi-user.target
       }
 
       clearServerPrometheusCache(server.id);
+      logStreamHub.disconnectServerAgent(server.id, 'agent_stopped');
       const stoppedView = await stopServerAgent(server.id);
       return res.status(200).json(stoppedView);
     } catch (error: any) {
@@ -2263,6 +2395,7 @@ WantedBy=multi-user.target
           : 'revoked_by_operator';
 
       clearServerPrometheusCache(server.id);
+      logStreamHub.disconnectServerAgent(server.id, reason);
       const revokedView = await revokeServerAgentCertificate(server.id, reason);
       logger.info({
         component: 'agent',
@@ -2592,6 +2725,7 @@ async function startServer() {
   const app = createApp();
   const httpServer = http.createServer(app);
   attachTerminalWebSocketServer(httpServer);
+  attachAgentLogStreamWebSocketServer(httpServer);
 
   const PORT = Number(process.env.PORT) || 3000;
 

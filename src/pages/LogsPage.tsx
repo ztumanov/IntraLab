@@ -1,32 +1,45 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Link, useOutletContext, useSearchParams } from 'react-router-dom';
 import {
-  Activity,
   AlertCircle,
+  ArrowDownCircle,
   ArrowUpRight,
   Check,
   Copy,
   Download,
-  FileText,
   KeyRound,
+  Pause,
+  Play,
   Plus,
+  Radio,
   RefreshCw,
   Search,
   Server as ServerIcon,
-  ShieldAlert,
+  Square,
   Terminal,
+  Trash2,
 } from 'lucide-react';
 import {
   useServerCommandLogs,
+  useServerDocker,
   useServers,
   useServerSystemLogs,
 } from '../hooks/useServers.ts';
-import { LogSeverity, SystemLogSource } from '../types/server.ts';
+import { buildServerLogStreamUrl } from '../api/servers.ts';
+import {
+  LogSeverity,
+  LogStreamStatusEvent,
+  RealTimeLogEvent,
+  SystemLogLine,
+  SystemLogSource,
+} from '../types/server.ts';
 import { useI18n } from '../context/I18nContext.tsx';
 
 interface LayoutOutletContext {
   openAddServerModal: () => void;
 }
+
+const MAX_CLIENT_LOG_LINES = 1000;
 
 const LOG_SOURCES: {
   id: SystemLogSource;
@@ -38,27 +51,50 @@ const LOG_SOURCES: {
     id: 'journald',
     labelRu: 'Systemd (journalctl)',
     labelEn: 'Systemd (journalctl)',
-    cmdHint: 'journalctl -n <N> --no-pager -o short-iso',
+    cmdHint: 'journalctl -f --no-pager -o short-iso',
   },
   {
     id: 'auth',
     labelRu: 'SSH и Безопасность (auth)',
     labelEn: 'SSH & Auth (sshd)',
-    cmdHint: 'journalctl -u ssh -u sshd / /var/log/auth.log',
+    cmdHint: 'journalctl -u ssh -u sshd -f -o short-iso',
   },
   {
     id: 'kernel',
     labelRu: 'Ядро Linux (dmesg)',
     labelEn: 'Kernel (dmesg)',
-    cmdHint: 'journalctl -k / dmesg -T',
+    cmdHint: 'journalctl -k -f --no-pager -o short-iso',
   },
   {
     id: 'docker',
     labelRu: 'Docker Daemon & Containers',
     labelEn: 'Docker Daemon & Containers',
-    cmdHint: 'journalctl -u docker / docker logs',
+    cmdHint: 'docker logs --follow --timestamps <container>',
   },
 ];
+
+function convertEventToLogLine(
+  ev: RealTimeLogEvent,
+  lineNumber: number
+): SystemLogLine {
+  const severity: LogSeverity =
+    ev.level === 'error' || ev.level === 'warn' || ev.level === 'info'
+      ? ev.level
+      : 'info';
+  const service =
+    ev.source === 'docker'
+      ? ev.container_name || ev.container_id || 'docker'
+      : ev.unit || ev.source || 'journal';
+  const raw = `${ev.timestamp} ${service}: ${ev.message}`;
+  return {
+    line_number: lineNumber,
+    timestamp: ev.timestamp,
+    severity,
+    service,
+    message: ev.message,
+    raw,
+  };
+}
 
 export const LogsPage: React.FC = () => {
   const { t } = useI18n();
@@ -71,12 +107,26 @@ export const LogsPage: React.FC = () => {
   const [selectedServerId, setSelectedServerId] = useState<number>(0);
   const [activeTab, setActiveTab] = useState<'stream' | 'audit'>('stream');
   const [source, setSource] = useState<SystemLogSource>('journald');
+  const [unitFilter, setUnitFilter] = useState<string>('');
+  const [selectedContainer, setSelectedContainer] = useState<string>('');
   const [tailLines, setTailLines] = useState<number>(100);
-  const [liveTail, setLiveTail] = useState<boolean>(false);
+
+  // Real-time SSE streaming state
+  const [isStreaming, setIsStreaming] = useState<boolean>(true);
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [autoScroll, setAutoScroll] = useState<boolean>(true);
+  const [streamStatus, setStreamStatus] = useState<LogStreamStatusEvent | null>(null);
+  const [streamedLines, setStreamedLines] = useState<SystemLogLine[]>([]);
+  const [clearedBaselineCount, setClearedBaselineCount] = useState<number>(0);
+
   const [severityFilter, setSeverityFilter] = useState<'all' | LogSeverity>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [wrapLines, setWrapLines] = useState<boolean>(true);
   const [copied, setCopied] = useState<boolean>(false);
+
+  const isPausedRef = useRef<boolean>(false);
+  isPausedRef.current = isPaused;
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (servers.length === 0) return;
@@ -93,12 +143,16 @@ export const LogsPage: React.FC = () => {
 
   const handleSelectServer = (id: number) => {
     setSelectedServerId(id);
+    setSelectedContainer('');
+    setStreamedLines([]);
+    setClearedBaselineCount(0);
     setSearchParams({ serverId: String(id) }, { replace: true });
   };
 
   const selectedServer =
     servers.find((s) => s.id === selectedServerId) || servers[0] || null;
 
+  // Initial history / fallback snapshot via existing Logs API (no polling when SSE stream is active)
   const {
     data: logsData,
     isLoading: isLoadingLogs,
@@ -110,7 +164,13 @@ export const LogsPage: React.FC = () => {
     selectedServer?.id || 0,
     source,
     tailLines,
-    liveTail ? 5000 : false
+    false
+  );
+
+  // Fetch container list when source === 'docker' so user can pick a container for `docker logs --follow`
+  const { data: dockerData } = useServerDocker(
+    source === 'docker' && selectedServer ? selectedServer.id : 0,
+    false
   );
 
   const {
@@ -120,6 +180,131 @@ export const LogsPage: React.FC = () => {
     error: auditError,
     refetch: refetchAudit,
   } = useServerCommandLogs(selectedServer?.id || 0);
+
+  // Reset stream buffer when switching server, source, unit, or container
+  useEffect(() => {
+    setStreamedLines([]);
+    setClearedBaselineCount(0);
+  }, [selectedServer?.id, source, unitFilter, selectedContainer]);
+
+  // Manage real-time SSE EventSource connection
+  useEffect(() => {
+    const serverId = selectedServer?.id || 0;
+    if (!serverId || !isStreaming || activeTab !== 'stream') {
+      setStreamStatus(null);
+      return;
+    }
+
+    let eventSource: EventSource | null = null;
+    let cancelled = false;
+
+    const connectSse = async () => {
+      try {
+        const url = await buildServerLogStreamUrl({
+          serverId,
+          source,
+          unit: source === 'journald' ? unitFilter : undefined,
+          container: source === 'docker' ? selectedContainer : undefined,
+          tail: tailLines,
+        });
+        if (cancelled) return;
+
+        const es = new EventSource(url);
+        eventSource = es;
+
+        es.addEventListener('status', (evt: MessageEvent) => {
+          if (cancelled) return;
+          try {
+            const parsed = JSON.parse(evt.data) as LogStreamStatusEvent;
+            setStreamStatus(parsed);
+          } catch {
+            // Ignore malformed status event
+          }
+        });
+
+        es.addEventListener('log', (evt: MessageEvent) => {
+          if (cancelled || isPausedRef.current) return;
+          try {
+            const rawEv = JSON.parse(evt.data) as RealTimeLogEvent;
+            setStreamedLines((prev) => {
+              const nextNum =
+                prev.length > 0 ? prev[prev.length - 1].line_number + 1 : 1;
+              const nextLine = convertEventToLogLine(rawEv, nextNum);
+              const updated = [...prev, nextLine];
+              if (updated.length > MAX_CLIENT_LOG_LINES) {
+                return updated.slice(updated.length - MAX_CLIENT_LOG_LINES);
+              }
+              return updated;
+            });
+          } catch {
+            // Ignore malformed log event
+          }
+        });
+
+        es.onerror = () => {
+          if (cancelled) return;
+          setStreamStatus((prev) => ({
+            status: 'reconnecting',
+            server_id: serverId,
+            transport: prev?.transport,
+            agent_id: prev?.agent_id,
+            message: 'SSE stream interrupted; browser EventSource is reconnecting...',
+            timestamp: new Date().toISOString(),
+          }));
+        };
+      } catch {
+        // Ignore URL construction error
+      }
+    };
+
+    void connectSse();
+
+    return () => {
+      cancelled = true;
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+    };
+  }, [
+    selectedServer?.id,
+    source,
+    unitFilter,
+    selectedContainer,
+    tailLines,
+    isStreaming,
+    activeTab,
+  ]);
+
+  // Combine initial historical snapshot lines with real-time streamed SSE lines
+  const baseLines =
+    clearedBaselineCount > 0
+      ? []
+      : (logsData?.lines || []).slice(-MAX_CLIENT_LOG_LINES);
+
+  const combinedLines: SystemLogLine[] = React.useMemo(() => {
+    if (streamedLines.length === 0) {
+      return baseLines;
+    }
+    const existingRaws = new Set(baseLines.slice(-80).map((l) => l.raw));
+    const dedupedStream = streamedLines.filter((l) => !existingRaws.has(l.raw));
+    const merged = [...baseLines, ...dedupedStream];
+    const sliced =
+      merged.length > MAX_CLIENT_LOG_LINES
+        ? merged.slice(merged.length - MAX_CLIENT_LOG_LINES)
+        : merged;
+    return sliced.map((line, idx) => ({
+      ...line,
+      line_number: idx + 1,
+    }));
+  }, [baseLines, streamedLines]);
+
+  // Auto-scroll terminal box when new lines arrive
+  useEffect(() => {
+    if (!autoScroll || isPaused || !scrollContainerRef.current) return;
+    const el = scrollContainerRef.current;
+    el.scrollTop = el.scrollHeight;
+  }, [combinedLines.length, autoScroll, isPaused]);
 
   if (isLoadingServers) {
     return (
@@ -152,8 +337,8 @@ export const LogsPage: React.FC = () => {
           </h2>
           <p className="mt-1 text-xs text-slate-400 max-w-md mx-auto">
             {t(
-              'Добавьте Linux-сервер с доступом по SSH, чтобы читать системные журналы и логи контейнеров в реальном времени.',
-              'Add a Linux server with SSH credentials to inspect system and container logs in real time.'
+              'Добавьте Linux-сервер с доступом по SSH или infralab-agent, чтобы читать системные журналы и логи контейнеров в реальном времени.',
+              'Add a Linux server with SSH credentials or infralab-agent to stream system and container logs in real time.'
             )}
           </p>
           <button
@@ -170,7 +355,7 @@ export const LogsPage: React.FC = () => {
   }
 
   const activeServer = selectedServer!;
-  const allLines = logsData?.lines || [];
+  const allLines = combinedLines;
 
   const errorCount = allLines.filter((l) => l.severity === 'error').length;
   const warnCount = allLines.filter((l) => l.severity === 'warn').length;
@@ -186,6 +371,11 @@ export const LogsPage: React.FC = () => {
       line.message.toLowerCase().includes(q);
     return matchesSeverity && matchesQuery;
   });
+
+  const handleClearBuffer = () => {
+    setStreamedLines([]);
+    setClearedBaselineCount((c) => c + 1);
+  };
 
   const handleCopyVisibleLogs = async () => {
     const text = filteredLines.map((l) => l.raw).join('\n');
@@ -219,48 +409,93 @@ export const LogsPage: React.FC = () => {
   const activeSourceMeta =
     LOG_SOURCES.find((s) => s.id === source) || LOG_SOURCES[0];
 
+  const isAgentMtls =
+    streamStatus?.transport === 'agent_mtls' || streamStatus?.transport === 'agent_http';
+
   return (
     <div className="space-y-6">
       {/* Page Header */}
       <div className="flex flex-col gap-4 border-b border-slate-800 pb-5 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-slate-100">
-            {t('Потоковые логи и журналы ОС (Logs)', 'System & Container Log Stream')}
+            {t('Потоковые логи и журналы ОС (Logs)', 'Real-Time System & Container Log Stream')}
           </h1>
           <p className="mt-1 text-sm text-slate-400">
             {t(
-              'Агрегация логов systemd journald, безопасности SSH, ядра Linux, Docker и истории выполнения команд.',
-              'Real-time SSH log aggregation across journald, sshd auth, kernel dmesg, Docker, and command audit history.'
+              'Потоковая передача логов (SSE + mTLS Agent / SSH fallback): systemd journalctl, sshd auth, dmesg, Docker и аудит команд.',
+              'Real-time SSE log streaming via mTLS Agent & SSH fallback across journald, sshd auth, kernel dmesg, and Docker containers.'
             )}
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2.5 self-start sm:self-auto">
+        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+          {/* Start / Stop Live SSE Stream */}
           <button
             type="button"
-            onClick={() => setLiveTail((prev) => !prev)}
+            onClick={() => {
+              setIsStreaming((prev) => !prev);
+              setIsPaused(false);
+            }}
             className={`inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
-              liveTail
+              isStreaming
                 ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
                 : 'border-slate-700 bg-[#1E293B] text-slate-300 hover:bg-slate-800'
             }`}
           >
-            <Activity
-              className={`h-3.5 w-3.5 ${
-                liveTail ? 'text-emerald-400 animate-pulse' : 'text-slate-400'
-              }`}
-            />
-            <span>
-              {liveTail
-                ? t('Live Tail: 5с (ВКЛ)', 'Live Tail: 5s (ON)')
-                : t('Live Tail (5с)', 'Live Tail (5s)')}
-            </span>
+            {isStreaming ? (
+              <>
+                <Square className="h-3.5 w-3.5 text-emerald-400 fill-emerald-400/30" />
+                <span>{t('Live Stream: ВКЛ (SSE)', 'Live Stream: ON (SSE)')}</span>
+              </>
+            ) : (
+              <>
+                <Radio className="h-3.5 w-3.5 text-slate-400" />
+                <span>{t('Запустить Live Stream', 'Start Live Stream')}</span>
+              </>
+            )}
           </button>
 
+          {/* Pause / Resume Stream */}
+          {isStreaming && (
+            <button
+              type="button"
+              onClick={() => setIsPaused((p) => !p)}
+              className={`inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
+                isPaused
+                  ? 'border-amber-500/50 bg-amber-500/15 text-amber-300'
+                  : 'border-slate-700 bg-[#1E293B] text-slate-300 hover:bg-slate-800'
+              }`}
+            >
+              {isPaused ? (
+                <>
+                  <Play className="h-3.5 w-3.5 text-amber-400" />
+                  <span>{t('Продолжить', 'Resume')}</span>
+                </>
+              ) : (
+                <>
+                  <Pause className="h-3.5 w-3.5 text-slate-400" />
+                  <span>{t('Пауза', 'Pause')}</span>
+                </>
+              )}
+            </button>
+          )}
+
+          {/* Clear Buffer */}
+          <button
+            type="button"
+            onClick={handleClearBuffer}
+            className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#1E293B] px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-slate-800 whitespace-nowrap"
+          >
+            <Trash2 className="h-3.5 w-3.5 text-slate-400" />
+            <span>{t('Очистить', 'Clear')}</span>
+          </button>
+
+          {/* Manual Snapshot Refresh */}
           <button
             type="button"
             onClick={() => {
               if (activeTab === 'stream') {
+                setClearedBaselineCount(0);
                 refetchLogs();
               } else {
                 refetchAudit();
@@ -274,8 +509,8 @@ export const LogsPage: React.FC = () => {
             />
             <span>
               {isFetchingLogs
-                ? t('Чтение по SSH...', 'Streaming SSH...')
-                : t('Обновить логи', 'Refresh Logs')}
+                ? t('Чтение снимка...', 'Fetching Snapshot...')
+                : t('Обновить снимок', 'Refresh Snapshot')}
             </span>
           </button>
         </div>
@@ -336,14 +571,14 @@ export const LogsPage: React.FC = () => {
           </div>
         </div>
 
-        {!activeServer.has_secret && (
+        {!activeServer.has_secret && !isAgentMtls && (
           <div className="mt-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-950/20 px-3.5 py-2.5 text-xs text-amber-200">
             <div className="flex items-center gap-2">
               <AlertCircle className="h-4 w-4 text-amber-400 shrink-0" />
               <span>
                 {t(
-                  `Для сервера «${activeServer.name}» не задан пароль или приватный SSH-ключ.`,
-                  `SSH credentials are not configured for "${activeServer.name}".`
+                  `Для сервера «${activeServer.name}» не задан пароль/SSH-ключ. Для чтения логов подключите infralab-agent по mTLS или настройте SSH.`,
+                  `SSH credentials are not configured for "${activeServer.name}". Connect infralab-agent via mTLS or configure SSH credentials.`
                 )}
               </span>
             </div>
@@ -352,7 +587,7 @@ export const LogsPage: React.FC = () => {
               className="inline-flex items-center gap-1.5 font-semibold text-amber-300 hover:underline whitespace-nowrap"
             >
               <KeyRound className="h-3.5 w-3.5" />
-              <span>{t('Настроить SSH-доступ →', 'Configure SSH Credentials →')}</span>
+              <span>{t('Настроить доступ →', 'Configure Access →')}</span>
             </Link>
           </div>
         )}
@@ -363,13 +598,16 @@ export const LogsPage: React.FC = () => {
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <div className="rounded-lg border border-slate-800 bg-[#1E293B] p-5">
             <p className="text-xs font-medium text-slate-400">
-              {t('Строк в буфере', 'Buffered Log Lines')}
+              {t('Строк в буфере (макс. 1000)', 'Buffered Log Lines (max 1000)')}
             </p>
             <p className="mt-2 font-mono text-3xl font-semibold text-slate-100 tabular-nums">
-              {isLoadingLogs ? '—' : allLines.length}
+              {isLoadingLogs && allLines.length === 0 ? '—' : allLines.length}
             </p>
             <p className="mt-2 text-xs text-slate-500 font-mono truncate">
-              {activeSourceMeta.id} (tail -{tailLines})
+              {activeSourceMeta.id}{' '}
+              {streamedLines.length > 0
+                ? `(+${streamedLines.length} live)`
+                : `(tail -${tailLines})`}
             </p>
           </div>
 
@@ -378,7 +616,7 @@ export const LogsPage: React.FC = () => {
               {t('Ошибки (ERROR / CRIT)', 'Errors & Failures')}
             </p>
             <p className="mt-2 font-mono text-3xl font-semibold text-rose-400 tabular-nums">
-              {isLoadingLogs ? '—' : errorCount}
+              {isLoadingLogs && allLines.length === 0 ? '—' : errorCount}
             </p>
             <p className="mt-2 text-xs text-slate-500">
               {t('События error / failed / denied', 'Matched error / failed / denied')}
@@ -390,7 +628,7 @@ export const LogsPage: React.FC = () => {
               {t('Предупреждения (WARN)', 'Warnings')}
             </p>
             <p className="mt-2 font-mono text-3xl font-semibold text-amber-400 tabular-nums">
-              {isLoadingLogs ? '—' : warnCount}
+              {isLoadingLogs && allLines.length === 0 ? '—' : warnCount}
             </p>
             <p className="mt-2 text-xs text-slate-500">
               {t('События warn / timeout / retry', 'Matched warn / timeout / retry')}
@@ -399,13 +637,23 @@ export const LogsPage: React.FC = () => {
 
           <div className="rounded-lg border border-slate-800 bg-[#1E293B] p-5">
             <p className="text-xs font-medium text-slate-400">
-              {t('Журнал SSH-команд', 'SSH Audit History')}
+              {t('Канал потоковой передачи', 'Stream Transport')}
             </p>
-            <p className="mt-2 font-mono text-3xl font-semibold text-emerald-400 tabular-nums">
-              {isLoadingAudit ? '—' : auditLogs.length}
+            <p className="mt-2 font-mono text-lg font-semibold text-emerald-400 truncate">
+              {!isStreaming
+                ? t('SNAPSHOT (Остановлен)', 'SNAPSHOT (Stopped)')
+                : isPaused
+                  ? t('PAUSED (Пауза)', 'PAUSED')
+                  : isAgentMtls
+                    ? 'SSE · Agent mTLS'
+                    : streamStatus?.status === 'reconnecting'
+                      ? t('RECONNECTING...', 'RECONNECTING...')
+                      : 'SSE · Live Stream'}
             </p>
-            <p className="mt-2 text-xs text-slate-500">
-              {t('Записей в PostgreSQL', 'Recorded in PostgreSQL')}
+            <p className="mt-2 text-xs text-slate-500 font-mono truncate">
+              {streamStatus?.agent_id
+                ? `Agent: ${streamStatus.agent_id}`
+                : t('Без периодического polling', 'Zero-polling EventSource')}
             </p>
           </div>
         </div>
@@ -452,6 +700,35 @@ export const LogsPage: React.FC = () => {
 
           {activeTab === 'stream' && (
             <div className="flex flex-wrap items-center gap-2">
+              {/* Optional Unit selector when source === 'journald' */}
+              {source === 'journald' && (
+                <input
+                  type="text"
+                  value={unitFilter}
+                  onChange={(e) => setUnitFilter(e.target.value)}
+                  placeholder={t('Юнит (напр. nginx.service)', 'Unit (e.g. nginx.service)')}
+                  className="w-44 rounded-md border border-slate-700 bg-[#0F172A] px-2.5 py-1 font-mono text-xs text-slate-100 placeholder-slate-500 focus:border-emerald-500 focus:outline-none"
+                />
+              )}
+
+              {/* Docker Container selector when source === 'docker' */}
+              {source === 'docker' && (
+                <select
+                  value={selectedContainer}
+                  onChange={(e) => setSelectedContainer(e.target.value)}
+                  className="rounded-md border border-slate-700 bg-[#0F172A] px-2.5 py-1 font-mono text-xs text-slate-100 focus:border-emerald-500 focus:outline-none"
+                >
+                  <option value="">
+                    {t('Все контейнеры / демон dockerd', 'All containers / dockerd unit')}
+                  </option>
+                  {(dockerData?.containers || []).map((c) => (
+                    <option key={c.id} value={c.name || c.id}>
+                      {c.name} ({c.image}) [{c.state}]
+                    </option>
+                  ))}
+                </select>
+              )}
+
               <div className="flex items-center rounded-md border border-slate-800 bg-[#0F172A] p-0.5 font-mono text-xs">
                 {[50, 100, 250, 500].map((cnt) => (
                   <button
@@ -511,8 +788,8 @@ export const LogsPage: React.FC = () => {
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder={t(
-                    'Фильтр по тексту (grep), сервису или PID...',
-                    'Filter log lines by keyword, service, or PID...'
+                    'Фильтр по тексту (grep), сервису, контейнеру или PID...',
+                    'Filter log lines by keyword, service, container, or PID...'
                   )}
                   className="w-full rounded-md border border-slate-700 bg-[#0F172A] py-1.5 pl-9 pr-3 font-mono text-xs text-slate-100 placeholder-slate-500 focus:border-emerald-500 focus:outline-none"
                 />
@@ -542,6 +819,24 @@ export const LogsPage: React.FC = () => {
                   ))}
                 </div>
 
+                {/* Auto-scroll toggle */}
+                <button
+                  type="button"
+                  onClick={() => setAutoScroll((a) => !a)}
+                  className={`inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-mono transition-colors ${
+                    autoScroll
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                      : 'border-slate-700 bg-[#0F172A] text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <ArrowDownCircle className="h-3.5 w-3.5" />
+                  <span>
+                    {autoScroll
+                      ? t('Автоскролл: ВКЛ', 'Auto-scroll: ON')
+                      : t('Автоскролл: ВЫКЛ', 'Auto-scroll: OFF')}
+                  </span>
+                </button>
+
                 <button
                   type="button"
                   onClick={() => setWrapLines((w) => !w)}
@@ -559,18 +854,36 @@ export const LogsPage: React.FC = () => {
             {/* Terminal Stream Output Box */}
             <div className="overflow-hidden rounded-lg border border-slate-800 bg-[#0B1120]">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/90 bg-[#0F172A] px-4 py-2 font-mono text-[11px] text-slate-400">
-                <span className="truncate">
-                  {activeServer.username}@{activeServer.hostname}:~$ {activeSourceMeta.cmdHint}
-                </span>
+                <div className="flex items-center gap-2 truncate">
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      !isStreaming
+                        ? 'bg-slate-500'
+                        : isPaused
+                          ? 'bg-amber-400'
+                          : 'bg-emerald-400 animate-pulse'
+                    }`}
+                  />
+                  <span className="truncate">
+                    {activeServer.username}@{activeServer.hostname}:~${' '}
+                    {source === 'docker' && selectedContainer
+                      ? `docker logs --follow --timestamps ${selectedContainer}`
+                      : source === 'journald' && unitFilter
+                        ? `journalctl -u ${unitFilter} -f --no-pager -o short-iso`
+                        : activeSourceMeta.cmdHint}
+                  </span>
+                </div>
                 <span className="tabular-nums shrink-0">
                   {t('Показано строк:', 'Showing:')} {filteredLines.length} / {allLines.length}
-                  {logsData?.fetched_at
-                    ? ` · ${new Date(logsData.fetched_at).toISOString().slice(11, 19)} UTC`
-                    : ''}
+                  {streamStatus?.timestamp
+                    ? ` · ${new Date(streamStatus.timestamp).toISOString().slice(11, 19)} UTC`
+                    : logsData?.fetched_at
+                      ? ` · ${new Date(logsData.fetched_at).toISOString().slice(11, 19)} UTC`
+                      : ''}
                 </span>
               </div>
 
-              {isLoadingLogs ? (
+              {isLoadingLogs && allLines.length === 0 ? (
                 <div className="p-6 space-y-2.5">
                   {[1, 2, 3, 4, 5, 6].map((n) => (
                     <div
@@ -579,7 +892,7 @@ export const LogsPage: React.FC = () => {
                     />
                   ))}
                 </div>
-              ) : isLogsError ? (
+              ) : isLogsError && allLines.length === 0 ? (
                 <div className="p-6 font-mono text-xs text-rose-300 bg-rose-950/20">
                   {(logsError as Error)?.message ||
                     t(
@@ -590,12 +903,15 @@ export const LogsPage: React.FC = () => {
               ) : filteredLines.length === 0 ? (
                 <div className="p-8 text-center font-mono text-xs text-slate-500">
                   {t(
-                    'Записи, подходящие под выбранный фильтр, не найдены.',
-                    'No log lines match the current filter.'
+                    'Ожидание новых событий в потоке или записи под фильтр не найдены...',
+                    'Waiting for real-time log events or no lines match the current filter...'
                   )}
                 </div>
               ) : (
-                <div className="max-h-[540px] overflow-y-auto overflow-x-auto divide-y divide-slate-900/80 font-mono text-xs">
+                <div
+                  ref={scrollContainerRef}
+                  className="max-h-[540px] overflow-y-auto overflow-x-auto divide-y divide-slate-900/80 font-mono text-xs"
+                >
                   {filteredLines.map((line) => {
                     const sevColor =
                       line.severity === 'error'

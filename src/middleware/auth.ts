@@ -17,13 +17,20 @@ export const requireAuth = async (
   next: NextFunction
 ) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized: Missing token' });
+  const queryToken =
+    req.method === 'GET' && typeof req.query?.token === 'string'
+      ? req.query.token.trim()
+      : '';
+
+  let token = '';
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split('Bearer ')[1]?.trim() || '';
+  } else if (queryToken) {
+    token = queryToken;
   }
 
-  const token = authHeader.split('Bearer ')[1]?.trim();
   if (!token) {
-    return res.status(401).json({ error: 'Unauthorized: Empty token' });
+    return res.status(401).json({ error: 'Unauthorized: Missing token' });
   }
 
   // 1. Verify signed Local Session Token (ila_sess.*)
