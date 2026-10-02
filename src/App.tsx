@@ -18,6 +18,7 @@ import { MapPage } from './pages/MapPage.tsx';
 import { NetworksPage } from './pages/NetworksPage.tsx';
 import { ContainersPage } from './pages/ContainersPage.tsx';
 import { DeploymentsPage } from './pages/DeploymentsPage.tsx';
+import { AutomationPage } from './pages/AutomationPage.tsx';
 import { MetricsPage } from './pages/MetricsPage.tsx';
 import { LogsPage } from './pages/LogsPage.tsx';
 import { AlertsPage } from './pages/AlertsPage.tsx';
@@ -65,6 +66,7 @@ const AppRoutes: React.FC = () => {
         <Route path="/map" element={<MapPage />} />
         <Route path="/networks" element={<NetworksPage />} />
         <Route path="/containers" element={<ContainersPage />} />
+        <Route path="/automation" element={<AutomationPage />} />
         <Route path="/deployments" element={<DeploymentsPage />} />
         <Route path="/files" element={<SftpFileManagerPage />} />
         <Route path="/metrics" element={<MetricsPage />} />

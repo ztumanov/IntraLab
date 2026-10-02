@@ -30,8 +30,14 @@ RUN npm run build
 FROM node:22-alpine AS runtime
 WORKDIR /app
 
+RUN apk add --no-cache ansible openssh-client sshpass python3
+
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV ANSIBLE_BIN=/usr/bin/ansible
+ENV ANSIBLE_PLAYBOOK_BIN=/usr/bin/ansible-playbook
+ENV ANSIBLE_TIMEOUT=120
+ENV ANSIBLE_WORK_DIR=/var/lib/infralab/ansible
 
 COPY --from=app-builder /app /app
 COPY --from=agent-builder /out/infralab-agent /app/bin/infralab-agent

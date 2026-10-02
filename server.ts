@@ -70,6 +70,31 @@ import {
   writeRemoteFileOverSsh,
 } from './src/server/sftpManager.ts';
 import {
+  addServerToInventory,
+  createInventoryRecord,
+  createPlaybookRecord,
+  deleteInventoryById,
+  deletePlaybookById,
+  getAnsibleJobById,
+  getInventoryById,
+  getPlaybookById,
+  listAnsibleJobsByUser,
+  listAutomationAuditLogsByUser,
+  listInventoriesByUser,
+  listPlaybooksByUser,
+  removeServerFromInventory,
+  updateInventoryRecord,
+  updatePlaybookRecord,
+} from './src/db/automation.ts';
+import {
+  ansibleJobManager,
+  checkAnsibleRuntime,
+  ensureStarterPlaybooksForUser,
+  validateAndSavePlaybookById,
+  validatePlaybookStaticSecurity,
+  validatePlaybookWithAnsibleCli,
+} from './src/server/ansibleRunner.ts';
+import {
   activateUserTotp,
   createLocalUserAccount,
   disableUserTotp,
@@ -2681,6 +2706,587 @@ WantedBy=multi-user.target
       return res.status(500).json({
         error: error?.message || 'Не удалось удалить объект на сервере',
       });
+    }
+  });
+
+  // ============================================================================
+  // Ansible Automation Module Endpoints (Runtime, Inventories, Playbooks, Jobs, SSE, Audit)
+  // ============================================================================
+
+  app.get('/api/automation/status', requireAuth, async (_req: AuthRequest, res) => {
+    try {
+      const status = await checkAnsibleRuntime();
+      return res.status(200).json(status);
+    } catch (error: any) {
+      return res.status(500).json({
+        available: false,
+        error: error?.message || 'Ansible is not installed or unavailable',
+      });
+    }
+  });
+
+  // --- Ansible Inventories ---
+  app.get('/api/automation/inventories', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const inventories = await listInventoriesByUser(uid);
+      return res.status(200).json(inventories);
+    } catch (error: any) {
+      console.error('GET /api/automation/inventories failed:', error);
+      return res.status(500).json({ error: 'Failed to load Ansible inventories' });
+    }
+  });
+
+  app.get('/api/automation/inventories/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid inventory ID' });
+      }
+      const inv = await getInventoryById(id, uid);
+      if (!inv) {
+        return res.status(404).json({ error: 'Inventory not found' });
+      }
+      return res.status(200).json(inv);
+    } catch (error: any) {
+      console.error('GET /api/automation/inventories/:id failed:', error);
+      return res.status(500).json({ error: 'Failed to load inventory details' });
+    }
+  });
+
+  app.post('/api/automation/inventories', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      const description =
+        typeof req.body?.description === 'string' ? req.body.description.trim() : '';
+      const groupName =
+        typeof req.body?.group_name === 'string' ? req.body.group_name.trim() : 'all';
+      const serverIds = Array.isArray(req.body?.server_ids)
+        ? req.body.server_ids.map((n: any) => Number(n)).filter((n: number) => Number.isInteger(n) && n > 0)
+        : [];
+
+      if (!name || name.length > 120) {
+        return res.status(400).json({ error: 'Inventory name is required (1–120 chars)' });
+      }
+      if (groupName && !/^[a-zA-Z0-9_.-]{1,64}$/.test(groupName)) {
+        return res.status(400).json({ error: 'Invalid inventory group name' });
+      }
+
+      const created = await createInventoryRecord({
+        userUid: uid,
+        name,
+        description,
+        groupName: groupName || 'all',
+        serverIds,
+      });
+      return res.status(201).json(created);
+    } catch (error: any) {
+      console.error('POST /api/automation/inventories failed:', error);
+      return res.status(500).json({ error: 'Failed to create Ansible inventory' });
+    }
+  });
+
+  app.put('/api/automation/inventories/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid inventory ID' });
+      }
+
+      const name = typeof req.body?.name === 'string' ? req.body.name.trim() : undefined;
+      const description =
+        typeof req.body?.description === 'string' ? req.body.description.trim() : undefined;
+      const groupName =
+        typeof req.body?.group_name === 'string' ? req.body.group_name.trim() : undefined;
+      const serverIds = Array.isArray(req.body?.server_ids)
+        ? req.body.server_ids.map((n: any) => Number(n)).filter((n: number) => Number.isInteger(n) && n > 0)
+        : undefined;
+
+      if (name !== undefined && (!name || name.length > 120)) {
+        return res.status(400).json({ error: 'Inventory name must be 1–120 characters' });
+      }
+      if (groupName !== undefined && groupName && !/^[a-zA-Z0-9_.-]{1,64}$/.test(groupName)) {
+        return res.status(400).json({ error: 'Invalid inventory group name' });
+      }
+
+      const updated = await updateInventoryRecord({
+        id,
+        userUid: uid,
+        name,
+        description,
+        groupName,
+        serverIds,
+      });
+      if (!updated) {
+        return res.status(404).json({ error: 'Inventory not found' });
+      }
+      return res.status(200).json(updated);
+    } catch (error: any) {
+      console.error('PUT /api/automation/inventories/:id failed:', error);
+      return res.status(500).json({ error: 'Failed to update Ansible inventory' });
+    }
+  });
+
+  app.post('/api/automation/inventories/:id/servers', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      const serverId = Number(req.body?.server_id);
+      const groupName =
+        typeof req.body?.group_name === 'string' ? req.body.group_name.trim() : undefined;
+
+      if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(serverId) || serverId <= 0) {
+        return res.status(400).json({ error: 'Valid inventory ID and server_id are required' });
+      }
+
+      const updated = await addServerToInventory({
+        inventoryId: id,
+        serverId,
+        groupName,
+        userUid: uid,
+      });
+      if (!updated) {
+        return res.status(404).json({ error: 'Inventory or server not found' });
+      }
+      return res.status(200).json(updated);
+    } catch (error: any) {
+      console.error('POST /api/automation/inventories/:id/servers failed:', error);
+      return res.status(500).json({ error: 'Failed to add server to inventory' });
+    }
+  });
+
+  app.delete(
+    '/api/automation/inventories/:id/servers/:serverId',
+    requireAuth,
+    async (req: AuthRequest, res) => {
+      try {
+        const uid = req.user!.uid;
+        const id = Number(req.params.id);
+        const serverId = Number(req.params.serverId);
+        if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(serverId) || serverId <= 0) {
+          return res.status(400).json({ error: 'Invalid inventory or server ID' });
+        }
+
+        const updated = await removeServerFromInventory({
+          inventoryId: id,
+          serverId,
+          userUid: uid,
+        });
+        if (!updated) {
+          return res.status(404).json({ error: 'Inventory not found' });
+        }
+        return res.status(200).json(updated);
+      } catch (error: any) {
+        console.error('DELETE /api/automation/inventories/:id/servers/:serverId failed:', error);
+        return res.status(500).json({ error: 'Failed to remove server from inventory' });
+      }
+    }
+  );
+
+  app.delete('/api/automation/inventories/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid inventory ID' });
+      }
+      const deleted = await deleteInventoryById(id, uid);
+      if (!deleted) {
+        return res.status(404).json({ error: 'Inventory not found' });
+      }
+      return res.status(200).json({ id, deleted: true });
+    } catch (error: any) {
+      console.error('DELETE /api/automation/inventories/:id failed:', error);
+      return res.status(500).json({ error: 'Failed to delete inventory' });
+    }
+  });
+
+  // --- Ansible Playbooks ---
+  app.get('/api/automation/playbooks', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      await ensureStarterPlaybooksForUser(uid);
+      const playbooks = await listPlaybooksByUser(uid);
+      return res.status(200).json(playbooks);
+    } catch (error: any) {
+      console.error('GET /api/automation/playbooks failed:', error);
+      return res.status(500).json({ error: 'Failed to load Ansible playbooks' });
+    }
+  });
+
+  app.get('/api/automation/playbooks/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid playbook ID' });
+      }
+      const playbook = await getPlaybookById(id, uid);
+      if (!playbook) {
+        return res.status(404).json({ error: 'Playbook not found' });
+      }
+      return res.status(200).json(playbook);
+    } catch (error: any) {
+      console.error('GET /api/automation/playbooks/:id failed:', error);
+      return res.status(500).json({ error: 'Failed to load playbook' });
+    }
+  });
+
+  app.post('/api/automation/playbooks', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      const description =
+        typeof req.body?.description === 'string' ? req.body.description.trim() : '';
+      const content = typeof req.body?.content === 'string' ? req.body.content : '';
+
+      if (!name || name.length > 140) {
+        return res.status(400).json({ error: 'Playbook name is required (1–140 chars)' });
+      }
+
+      const staticCheck = validatePlaybookStaticSecurity(content);
+      if (!staticCheck.ok) {
+        return res.status(400).json({ error: staticCheck.error });
+      }
+
+      const created = await createPlaybookRecord({
+        userUid: uid,
+        name,
+        description,
+        content,
+        validationStatus: 'unverified',
+        validationMessage: '',
+      });
+
+      return res.status(201).json(created);
+    } catch (error: any) {
+      console.error('POST /api/automation/playbooks failed:', error);
+      return res.status(500).json({ error: 'Failed to create playbook' });
+    }
+  });
+
+  app.put('/api/automation/playbooks/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid playbook ID' });
+      }
+
+      const name = typeof req.body?.name === 'string' ? req.body.name.trim() : undefined;
+      const description =
+        typeof req.body?.description === 'string' ? req.body.description.trim() : undefined;
+      const content = typeof req.body?.content === 'string' ? req.body.content : undefined;
+
+      if (name !== undefined && (!name || name.length > 140)) {
+        return res.status(400).json({ error: 'Playbook name must be 1–140 chars' });
+      }
+
+      if (content !== undefined) {
+        const staticCheck = validatePlaybookStaticSecurity(content);
+        if (!staticCheck.ok) {
+          return res.status(400).json({ error: staticCheck.error });
+        }
+      }
+
+      const updated = await updatePlaybookRecord({
+        id,
+        userUid: uid,
+        name,
+        description,
+        content,
+        validationStatus: content !== undefined ? 'unverified' : undefined,
+        validationMessage: content !== undefined ? '' : undefined,
+      });
+
+      if (!updated) {
+        return res.status(404).json({ error: 'Playbook not found' });
+      }
+      return res.status(200).json(updated);
+    } catch (error: any) {
+      console.error('PUT /api/automation/playbooks/:id failed:', error);
+      return res.status(500).json({ error: 'Failed to update playbook' });
+    }
+  });
+
+  app.delete('/api/automation/playbooks/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid playbook ID' });
+      }
+      const deleted = await deletePlaybookById(id, uid);
+      if (!deleted) {
+        return res.status(404).json({ error: 'Playbook not found' });
+      }
+      return res.status(200).json({ id, deleted: true });
+    } catch (error: any) {
+      console.error('DELETE /api/automation/playbooks/:id failed:', error);
+      return res.status(500).json({ error: 'Failed to delete playbook' });
+    }
+  });
+
+  app.post('/api/automation/playbooks/:id/validate', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid playbook ID' });
+      }
+
+      const result = await validateAndSavePlaybookById(id, uid);
+      if (!result) {
+        return res.status(404).json({ error: 'Playbook not found' });
+      }
+      return res.status(200).json(result);
+    } catch (error: any) {
+      const msg = error?.message || 'Ansible is not installed or unavailable';
+      if (msg.includes('Ansible is not installed or unavailable')) {
+        return res.status(503).json({ error: 'Ansible is not installed or unavailable' });
+      }
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  app.post(
+    '/api/automation/playbooks/validate-content',
+    requireAuth,
+    async (req: AuthRequest, res) => {
+      try {
+        const content = typeof req.body?.content === 'string' ? req.body.content : '';
+        const validation = await validatePlaybookWithAnsibleCli(content);
+        return res.status(200).json(validation);
+      } catch (error: any) {
+        const msg = error?.message || 'Ansible is not installed or unavailable';
+        if (msg.includes('Ansible is not installed or unavailable')) {
+          return res.status(503).json({ error: 'Ansible is not installed or unavailable' });
+        }
+        return res.status(500).json({ error: msg });
+      }
+    }
+  );
+
+  // --- Ansible Jobs & Live Execution ---
+  app.get('/api/automation/jobs', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+      const playbookId = req.query.playbook_id ? Number(req.query.playbook_id) : undefined;
+      const inventoryId = req.query.inventory_id ? Number(req.query.inventory_id) : undefined;
+      const dateFrom = typeof req.query.date_from === 'string' ? req.query.date_from : undefined;
+      const dateTo = typeof req.query.date_to === 'string' ? req.query.date_to : undefined;
+
+      const jobs = await listAnsibleJobsByUser(uid, {
+        status,
+        playbookId,
+        inventoryId,
+        dateFrom,
+        dateTo,
+      });
+      return res.status(200).json(jobs);
+    } catch (error: any) {
+      console.error('GET /api/automation/jobs failed:', error);
+      return res.status(500).json({ error: 'Failed to load Ansible job history' });
+    }
+  });
+
+  app.get('/api/automation/jobs/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid job ID' });
+      }
+
+      const job = await getAnsibleJobById(id, uid);
+      if (!job) {
+        return res.status(404).json({ error: 'Job not found' });
+      }
+
+      const active = ansibleJobManager.getActiveJob(id);
+      if (active) {
+        return res.status(200).json({
+          ...job,
+          status: active.status,
+          stdout: active.stdout || job.stdout,
+          stderr: active.stderr || job.stderr,
+        });
+      }
+
+      return res.status(200).json(job);
+    } catch (error: any) {
+      console.error('GET /api/automation/jobs/:id failed:', error);
+      return res.status(500).json({ error: 'Failed to load job details' });
+    }
+  });
+
+  app.post('/api/automation/jobs', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const playbookId = Number(req.body?.playbook_id);
+      const inventoryId = Number(req.body?.inventory_id);
+      const checkMode = Boolean(req.body?.check_mode);
+      const diffMode = Boolean(req.body?.diff_mode);
+      const tags = req.body?.tags;
+      const extraVars = req.body?.extra_vars;
+
+      if (!Number.isInteger(playbookId) || playbookId <= 0) {
+        return res.status(400).json({ error: 'Valid playbook_id is required' });
+      }
+      if (!Number.isInteger(inventoryId) || inventoryId <= 0) {
+        return res.status(400).json({ error: 'Valid inventory_id is required' });
+      }
+
+      const job = await ansibleJobManager.startJob({
+        userUid: uid,
+        playbookId,
+        inventoryId,
+        checkMode,
+        diffMode,
+        tags,
+        extraVars,
+      });
+
+      return res.status(201).json(job);
+    } catch (error: any) {
+      const msg = error?.message || 'Failed to start Ansible job';
+      if (msg.includes('Ansible is not installed or unavailable')) {
+        return res.status(503).json({ error: 'Ansible is not installed or unavailable' });
+      }
+      if (msg.includes('not found')) {
+        return res.status(404).json({ error: msg });
+      }
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  app.post('/api/automation/jobs/:id/cancel', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid job ID' });
+      }
+
+      const job = await getAnsibleJobById(id, uid);
+      if (!job) {
+        return res.status(404).json({ error: 'Job not found' });
+      }
+
+      const cancelled = ansibleJobManager.cancelJob(id);
+      return res.status(200).json({
+        id,
+        cancelled,
+        status: cancelled ? 'CANCELLED' : job.status,
+      });
+    } catch (error: any) {
+      console.error('POST /api/automation/jobs/:id/cancel failed:', error);
+      return res.status(500).json({ error: 'Failed to cancel Ansible job' });
+    }
+  });
+
+  app.get('/api/automation/jobs/:id/stream', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid job ID' });
+      }
+
+      const job = await getAnsibleJobById(id, uid);
+      if (!job) {
+        return res.status(404).json({ error: 'Job not found' });
+      }
+
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+
+      const active = ansibleJobManager.getActiveJob(id);
+      const initialStatus = active ? active.status : job.status;
+      const initialStdout = active ? active.stdout : job.stdout;
+      const initialStderr = active ? active.stderr : job.stderr;
+
+      res.write(
+        `event: snapshot\ndata: ${JSON.stringify({
+          id: job.id,
+          status: initialStatus,
+          stdout: initialStdout,
+          stderr: initialStderr,
+          exit_code: job.exit_code,
+          duration_ms: job.duration_ms,
+        })}\n\n`
+      );
+
+      if (!active || ['SUCCESS', 'FAILED', 'CANCELLED'].includes(initialStatus)) {
+        res.write(
+          `event: done\ndata: ${JSON.stringify({
+            status: initialStatus,
+            exit_code: job.exit_code,
+            duration_ms: job.duration_ms,
+          })}\n\n`
+        );
+        return res.end();
+      }
+
+      const onStatus = (payload: any) => {
+        res.write(`event: status\ndata: ${JSON.stringify(payload)}\n\n`);
+      };
+      const onOutput = (payload: any) => {
+        res.write(`event: output\ndata: ${JSON.stringify(payload)}\n\n`);
+      };
+      const onDone = (payload: any) => {
+        res.write(`event: done\ndata: ${JSON.stringify(payload)}\n\n`);
+        cleanup();
+        res.end();
+      };
+
+      const keepAliveTimer = setInterval(() => {
+        try {
+          res.write(': keepalive\n\n');
+        } catch {
+          cleanup();
+        }
+      }, 15000);
+
+      const cleanup = () => {
+        clearInterval(keepAliveTimer);
+        active.emitter.off('status', onStatus);
+        active.emitter.off('output', onOutput);
+        active.emitter.off('done', onDone);
+      };
+
+      active.emitter.on('status', onStatus);
+      active.emitter.on('output', onOutput);
+      active.emitter.on('done', onDone);
+
+      req.on('close', () => {
+        cleanup();
+      });
+    } catch (error: any) {
+      console.error('GET /api/automation/jobs/:id/stream failed:', error);
+      if (!res.headersSent) {
+        return res.status(500).json({ error: 'Failed to stream job output' });
+      }
+      res.end();
+    }
+  });
+
+  // --- Automation Audit Logs ---
+  app.get('/api/automation/audit-logs', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const logs = await listAutomationAuditLogsByUser(uid, 50);
+      return res.status(200).json(logs);
+    } catch (error: any) {
+      console.error('GET /api/automation/audit-logs failed:', error);
+      return res.status(500).json({ error: 'Failed to load automation audit logs' });
     }
   });
 

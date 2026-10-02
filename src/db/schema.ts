@@ -151,3 +151,84 @@ export const serverMetricsRelations = relations(serverMetrics, ({ one }) => ({
     references: [servers.id],
   }),
 }));
+
+export const ansibleInventories = pgTable('ansible_inventories', {
+  id: serial('id').primaryKey(),
+  userUid: text('user_uid')
+    .references(() => users.uid, { onDelete: 'cascade' })
+    .notNull(),
+  name: text('name').notNull(),
+  description: text('description').default('').notNull(),
+  groupName: text('group_name').default('all').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const ansibleInventoryServers = pgTable('ansible_inventory_servers', {
+  id: serial('id').primaryKey(),
+  inventoryId: integer('inventory_id')
+    .references(() => ansibleInventories.id, { onDelete: 'cascade' })
+    .notNull(),
+  serverId: integer('server_id')
+    .references(() => servers.id, { onDelete: 'cascade' })
+    .notNull(),
+  groupName: text('group_name').default('').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const ansiblePlaybooks = pgTable('ansible_playbooks', {
+  id: serial('id').primaryKey(),
+  userUid: text('user_uid')
+    .references(() => users.uid, { onDelete: 'cascade' })
+    .notNull(),
+  name: text('name').notNull(),
+  description: text('description').default('').notNull(),
+  content: text('content').notNull(),
+  validationStatus: text('validation_status').default('unverified').notNull(),
+  validationMessage: text('validation_message').default('').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const ansibleJobs = pgTable('ansible_jobs', {
+  id: serial('id').primaryKey(),
+  playbookId: integer('playbook_id').references(() => ansiblePlaybooks.id, {
+    onDelete: 'set null',
+  }),
+  playbookName: text('playbook_name').notNull(),
+  inventoryId: integer('inventory_id').references(() => ansibleInventories.id, {
+    onDelete: 'set null',
+  }),
+  inventoryName: text('inventory_name').notNull(),
+  status: text('status').default('PENDING').notNull(),
+  checkMode: integer('check_mode').default(0).notNull(),
+  diffMode: integer('diff_mode').default(0).notNull(),
+  tags: text('tags').default('').notNull(),
+  extraVarsJson: text('extra_vars_json').default('{}').notNull(),
+  stdout: text('stdout').default('').notNull(),
+  stderr: text('stderr').default('').notNull(),
+  exitCode: integer('exit_code'),
+  durationMs: integer('duration_ms').default(0).notNull(),
+  createdBy: text('created_by')
+    .references(() => users.uid, { onDelete: 'cascade' })
+    .notNull(),
+  startedAt: timestamp('started_at'),
+  finishedAt: timestamp('finished_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const automationAuditLogs = pgTable('automation_audit_logs', {
+  id: serial('id').primaryKey(),
+  eventType: text('event_type').notNull(),
+  jobId: integer('job_id')
+    .references(() => ansibleJobs.id, { onDelete: 'cascade' })
+    .notNull(),
+  userUid: text('user_uid')
+    .references(() => users.uid, { onDelete: 'cascade' })
+    .notNull(),
+  playbookName: text('playbook_name').notNull(),
+  inventoryName: text('inventory_name').notNull(),
+  targetServers: text('target_servers').default('[]').notNull(),
+  result: text('result').default('').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});

@@ -24,7 +24,75 @@ import { ServerGeoLocation } from '../types/server.ts';
 import { useI18n } from '../context/I18nContext.tsx';
 import { useCheckServerConnection } from '../hooks/useServers.ts';
 
-const GOOGLE_MAPS_API_KEY = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string) || '';
+const GOOGLE_MAPS_API_KEY =
+  ((import.meta as any).env?.VITE_GOOGLE_MAPS_API_KEY as string) || '';
+
+export interface MapSelectionState {
+  selectedServerId: number | null;
+  hasInitialized: boolean;
+}
+
+export function createInitialMapSelectionState(
+  filteredServerIds: number[],
+  compact = false
+): MapSelectionState {
+  if (!compact && filteredServerIds.length > 0) {
+    return {
+      selectedServerId: filteredServerIds[0],
+      hasInitialized: true,
+    };
+  }
+  return {
+    selectedServerId: null,
+    hasInitialized: false,
+  };
+}
+
+export function syncMapSelectionWithLocations(
+  state: MapSelectionState,
+  filteredServerIds: number[],
+  compact = false
+): MapSelectionState {
+  if (!state.hasInitialized) {
+    if (!compact && filteredServerIds.length > 0) {
+      return {
+        selectedServerId: filteredServerIds[0],
+        hasInitialized: true,
+      };
+    }
+    return state;
+  }
+
+  if (state.selectedServerId === null) {
+    return state;
+  }
+
+  if (!filteredServerIds.includes(state.selectedServerId)) {
+    return {
+      selectedServerId: null,
+      hasInitialized: true,
+    };
+  }
+
+  return state;
+}
+
+export function selectMapServer(
+  _state: MapSelectionState,
+  serverId: number
+): MapSelectionState {
+  return {
+    selectedServerId: serverId,
+    hasInitialized: true,
+  };
+}
+
+export function closeMapServerPopup(_state: MapSelectionState): MapSelectionState {
+  return {
+    selectedServerId: null,
+    hasInitialized: true,
+  };
+}
 
 interface CameraControllerProps {
   locations: ServerGeoLocation[];
@@ -38,24 +106,28 @@ const CameraController: React.FC<CameraControllerProps> = ({
   fitTrigger,
 }) => {
   const map = useMap();
+  const locationsRef = React.useRef(locations);
+  locationsRef.current = locations;
 
   useEffect(() => {
-    if (!map || locations.length === 0) return;
+    if (!map || selectedServerId === null) return;
 
-    if (selectedServerId !== null) {
-      const target = locations.find((item) => item.server.id === selectedServerId);
-      if (target) {
-        map.panTo({ lat: target.lat, lng: target.lng });
-        const currentZoom = map.getZoom() ?? 4;
-        if (currentZoom < 6) {
-          map.setZoom(7);
-        }
-        return;
+    const target = locationsRef.current.find((item) => item.server.id === selectedServerId);
+    if (target) {
+      map.panTo({ lat: target.lat, lng: target.lng });
+      const currentZoom = map.getZoom() ?? 4;
+      if (currentZoom < 6) {
+        map.setZoom(7);
       }
     }
+  }, [map, selectedServerId]);
 
-    if (locations.length === 1) {
-      map.panTo({ lat: locations[0].lat, lng: locations[0].lng });
+  useEffect(() => {
+    if (!map || fitTrigger === 0 || locationsRef.current.length === 0) return;
+
+    const currentLocations = locationsRef.current;
+    if (currentLocations.length === 1) {
+      map.panTo({ lat: currentLocations[0].lat, lng: currentLocations[0].lng });
       map.setZoom(6);
       return;
     }
@@ -65,7 +137,7 @@ const CameraController: React.FC<CameraControllerProps> = ({
     let minLng = 180;
     let maxLng = -180;
 
-    for (const loc of locations) {
+    for (const loc of currentLocations) {
       if (loc.lat < minLat) minLat = loc.lat;
       if (loc.lat > maxLat) maxLat = loc.lat;
       if (loc.lng < minLng) minLng = loc.lng;
@@ -76,7 +148,7 @@ const CameraController: React.FC<CameraControllerProps> = ({
     const lngSpan = Math.abs(maxLng - minLng);
 
     if (latSpan < 0.05 && lngSpan < 0.05) {
-      map.panTo({ lat: locations[0].lat, lng: locations[0].lng });
+      map.panTo({ lat: currentLocations[0].lat, lng: currentLocations[0].lng });
       map.setZoom(8);
     } else {
       map.fitBounds(
@@ -89,7 +161,7 @@ const CameraController: React.FC<CameraControllerProps> = ({
         48
       );
     }
-  }, [map, locations, selectedServerId, fitTrigger]);
+  }, [map, fitTrigger]);
 
   return null;
 };
@@ -258,9 +330,8 @@ export const ServerGeoMap: React.FC<ServerGeoMapProps> = ({
 }) => {
   const { t } = useI18n();
   const checkServerMutation = useCheckServerConnection();
-  const [selectedServerId, setSelectedServerId] = useState<number | null>(null);
   const [statusFilter, setStatusFilter] = useState<'all' | 'online' | 'offline'>('all');
-  const [fitTrigger, setFitTrigger] = useState(0);
+  const [fitTrigger, setFitTrigger] = useState(() => (compact ? 1 : 0));
 
   const filteredLocations = useMemo(() => {
     if (statusFilter === 'all') return locations;
@@ -270,15 +341,40 @@ export const ServerGeoMap: React.FC<ServerGeoMapProps> = ({
     return locations.filter((l) => l.server.status !== 'online');
   }, [locations, statusFilter]);
 
+  const filteredServerIds = useMemo(
+    () => filteredLocations.map((l) => l.server.id),
+    [filteredLocations]
+  );
+
+  const [selectionState, setSelectionState] = useState<MapSelectionState>(() =>
+    createInitialMapSelectionState(
+      locations.map((l) => l.server.id),
+      compact
+    )
+  );
+
   useEffect(() => {
-    if (
-      selectedServerId === null &&
-      filteredLocations.length > 0 &&
-      !compact
-    ) {
-      setSelectedServerId(filteredLocations[0].server.id);
-    }
-  }, [filteredLocations, selectedServerId, compact]);
+    setSelectionState((prev) => {
+      const next = syncMapSelectionWithLocations(prev, filteredServerIds, compact);
+      if (
+        next.selectedServerId === prev.selectedServerId &&
+        next.hasInitialized === prev.hasInitialized
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, [filteredServerIds, compact]);
+
+  const selectedServerId = selectionState.selectedServerId;
+
+  const handleSelectServer = (serverId: number) => {
+    setSelectionState((prev) => selectMapServer(prev, serverId));
+  };
+
+  const handleCloseInfoWindow = () => {
+    setSelectionState((prev) => closeMapServerPopup(prev));
+  };
 
   const selectedLocation = useMemo(
     () => locations.find((l) => l.server.id === selectedServerId) ?? null,
@@ -293,7 +389,7 @@ export const ServerGeoMap: React.FC<ServerGeoMapProps> = ({
   }, [locations]);
 
   const handleFitAll = () => {
-    setSelectedServerId(null);
+    setSelectionState((prev) => closeMapServerPopup(prev));
     setFitTrigger((prev) => prev + 1);
   };
 
@@ -435,8 +531,8 @@ export const ServerGeoMap: React.FC<ServerGeoMapProps> = ({
                     key={item.server.id}
                     item={item}
                     isSelected={selectedServerId === item.server.id}
-                    onSelect={(id) => setSelectedServerId(id)}
-                    onCloseInfoWindow={() => setSelectedServerId(null)}
+                    onSelect={handleSelectServer}
+                    onCloseInfoWindow={handleCloseInfoWindow}
                   />
                 ))}
               </Map>
@@ -469,7 +565,7 @@ export const ServerGeoMap: React.FC<ServerGeoMapProps> = ({
                   <button
                     key={loc.server.id}
                     type="button"
-                    onClick={() => setSelectedServerId(loc.server.id)}
+                    onClick={() => handleSelectServer(loc.server.id)}
                     className={`w-full rounded-md border p-3 text-left transition-colors ${
                       active
                         ? 'border-emerald-500/60 bg-[#0F172A] text-white'
