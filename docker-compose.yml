@@ -73,10 +73,6 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-infralab-aes256-gcm-master-secret-key-2026}
       SESSION_SECRET: ${SESSION_SECRET:-infralab-self-hosted-hmac-session-secret-2026}
       PROMETHEUS_URL: http://prometheus:9090
-      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@infralab.local}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin1337}
-      OPERATOR_EMAIL: ${OPERATOR_EMAIL:-admin@infralab.local}
       AGENT_CERT_TTL_HOURS: ${AGENT_CERT_TTL_HOURS:-72}
       AGENT_PKI_DIR: /var/lib/infralab/pki
     volumes:

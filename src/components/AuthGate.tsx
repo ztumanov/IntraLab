@@ -7,18 +7,16 @@ import {
   ShieldCheck,
   Smartphone,
   Terminal,
-  UserPlus,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext.tsx';
 import { useI18n } from '../context/I18nContext.tsx';
 
-type AuthMode = 'login' | 'register' | '2fa';
+type AuthMode = 'login' | '2fa';
 
 export const AuthGate: React.FC = () => {
   const {
     loginWithLocalCredentials,
     verifyLocal2faCode,
-    registerLocalAccount,
     signInWithGoogle,
     error,
     clearError,
@@ -26,11 +24,8 @@ export const AuthGate: React.FC = () => {
   const { locale, setLocale, t } = useI18n();
 
   const [mode, setMode] = useState<AuthMode>('login');
-  const [identifier, setIdentifier] = useState('admin');
+  const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
-  const [regUsername, setRegUsername] = useState('');
-  const [regEmail, setRegEmail] = useState('');
-  const [regPassword, setRegPassword] = useState('');
 
   // 2FA challenge state
   const [preAuthToken, setPreAuthToken] = useState('');
@@ -73,24 +68,6 @@ export const AuthGate: React.FC = () => {
     } finally {
       setSubmitting(false);
     }
-  };
-
-  const handleRegisterSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setSubmitting(true);
-    try {
-      await registerLocalAccount(regUsername, regEmail, regPassword);
-    } catch {
-      // Error is handled by AuthContext
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const fillDefaultDockerCredentials = () => {
-    clearError();
-    setIdentifier('admin');
-    setPassword('InfraLab!2026');
   };
 
   return (
@@ -164,40 +141,28 @@ export const AuthGate: React.FC = () => {
             </div>
 
             <div className="space-y-3 rounded-lg border border-slate-800 bg-[#1E293B]/70 p-4 text-xs">
-              <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
-                <span className="font-semibold text-slate-200">
+              <div className="flex items-center gap-2 font-semibold text-slate-200">
+                <Terminal className="h-4 w-4 text-emerald-400" />
+                <span>
                   {t(
-                    'Учётная запись администратора по умолчанию (Docker Bootstrap)',
-                    'Default Docker Bootstrap Administrator'
+                    'Создание учётной записи администратора',
+                    'Create Administrator Account'
                   )}
                 </span>
-                <button
-                  type="button"
-                  onClick={fillDefaultDockerCredentials}
-                  className="rounded border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 font-mono text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/20"
-                >
-                  {t('Подставить данные', 'Auto-fill')}
-                </button>
               </div>
-              <div className="grid grid-cols-2 gap-2 font-mono">
-                <div className="rounded border border-slate-800 bg-[#0F172A] px-3 py-2">
-                  <span className="block text-[10px] uppercase text-slate-400">
-                    {t('Логин / Email', 'Login / Email')}
-                  </span>
-                  <span className="text-slate-100">admin</span>
-                  <span className="ml-1 text-slate-500">(admin@infralab.local)</span>
-                </div>
-                <div className="rounded border border-slate-800 bg-[#0F172A] px-3 py-2">
-                  <span className="block text-[10px] uppercase text-slate-400">
-                    {t('Пароль по умолчанию', 'Default Password')}
-                  </span>
-                  <span className="text-emerald-400">InfraLab!2026</span>
-                </div>
+              <p className="text-[11px] leading-relaxed text-slate-300">
+                {t(
+                  'Публичная регистрация отключена в целях безопасности. Чтобы создать учётную запись администратора, выполните команду на сервере через Docker:',
+                  'Public self-registration is disabled for security. To create an administrator account, run the command on the host via Docker:'
+                )}
+              </p>
+              <div className="rounded border border-slate-800 bg-[#0F172A] px-3 py-2 font-mono text-[11px] text-emerald-400 select-all">
+                docker compose exec infralab npm run create-admin
               </div>
               <p className="text-[11px] text-slate-400">
                 {t(
-                  'Вы можете переопределить эти значения через переменные ADMIN_USERNAME, ADMIN_EMAIL и ADMIN_PASSWORD в docker-compose.yml или сменить пароль после входа.',
-                  'Override via ADMIN_USERNAME, ADMIN_EMAIL, and ADMIN_PASSWORD in docker-compose.yml or change the password in Settings.'
+                  'Команда создаст администратора в интерактивном режиме или с параметрами --username, --email, --password.',
+                  'Interactive CLI prompt or accepts --username, --email, --password flags.'
                 )}
               </p>
             </div>
@@ -227,32 +192,18 @@ export const AuthGate: React.FC = () => {
           {/* Right Column: Auth Card */}
           <div className="lg:col-span-6">
             <div className="rounded-xl border border-slate-800 bg-[#1E293B] p-6 shadow-xl sm:p-8">
-              {mode !== '2fa' && (
-                <div className="mb-6 flex rounded-lg border border-slate-800 bg-[#0F172A] p-1 text-xs font-medium">
-                  <button
-                    type="button"
-                    onClick={() => switchMode('login')}
-                    className={`flex flex-1 items-center justify-center gap-2 rounded-md py-2 transition-colors ${
-                      mode === 'login'
-                        ? 'bg-emerald-600 text-white shadow'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    <Lock className="h-3.5 w-3.5" />
-                    <span>{t('Локальный вход', 'Local Sign In')}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => switchMode('register')}
-                    className={`flex flex-1 items-center justify-center gap-2 rounded-md py-2 transition-colors ${
-                      mode === 'register'
-                        ? 'bg-emerald-600 text-white shadow'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    <UserPlus className="h-3.5 w-3.5" />
-                    <span>{t('Новый оператор', 'Create Account')}</span>
-                  </button>
+              {mode === 'login' && (
+                <div className="mb-6">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-100">
+                    <Lock className="h-4 w-4 text-emerald-400" />
+                    <span>{t('Вход в панель управления', 'Sign In to Control Plane')}</span>
+                  </div>
+                  <p className="mt-1 text-xs text-slate-400">
+                    {t(
+                      'Введите логин или email учётной записи администратора',
+                      'Enter your administrator username or email'
+                    )}
+                  </p>
                 </div>
               )}
 
@@ -275,24 +226,15 @@ export const AuthGate: React.FC = () => {
                       autoComplete="username"
                       value={identifier}
                       onChange={(e) => setIdentifier(e.target.value)}
-                      placeholder="admin / admin@infralab.local"
+                      placeholder="admin"
                       className="mt-1.5 w-full rounded-md border border-slate-700 bg-[#0F172A] px-3.5 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:border-emerald-500 focus:outline-none"
                     />
                   </div>
 
                   <div>
-                    <div className="flex items-center justify-between">
-                      <label className="block text-xs font-medium text-slate-300">
-                        {t('Пароль', 'Password')}
-                      </label>
-                      <button
-                        type="button"
-                        onClick={fillDefaultDockerCredentials}
-                        className="text-[11px] text-emerald-400 hover:underline"
-                      >
-                        {t('Использовать пароль Docker по умолчанию', 'Use default Docker password')}
-                      </button>
-                    </div>
+                    <label className="block text-xs font-medium text-slate-300">
+                      {t('Пароль', 'Password')}
+                    </label>
                     <input
                       type="password"
                       required
@@ -419,66 +361,7 @@ export const AuthGate: React.FC = () => {
                 </form>
               )}
 
-              {/* REGISTER NEW LOCAL OPERATOR */}
-              {mode === 'register' && (
-                <form onSubmit={handleRegisterSubmit} className="space-y-4">
-                  <div>
-                    <label className="block text-xs font-medium text-slate-300">
-                      {t('Логин оператора (Username)', 'Operator Username')}
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={regUsername}
-                      onChange={(e) => setRegUsername(e.target.value)}
-                      placeholder="devops_admin"
-                      className="mt-1.5 w-full rounded-md border border-slate-700 bg-[#0F172A] px-3.5 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:border-emerald-500 focus:outline-none"
-                    />
-                  </div>
 
-                  <div>
-                    <label className="block text-xs font-medium text-slate-300">
-                      {t('Email', 'Email Address')}
-                    </label>
-                    <input
-                      type="email"
-                      required
-                      value={regEmail}
-                      onChange={(e) => setRegEmail(e.target.value)}
-                      placeholder="devops@infralab.local"
-                      className="mt-1.5 w-full rounded-md border border-slate-700 bg-[#0F172A] px-3.5 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:border-emerald-500 focus:outline-none"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-medium text-slate-300">
-                      {t('Пароль (минимум 6 символов)', 'Password (min 6 chars)')}
-                    </label>
-                    <input
-                      type="password"
-                      required
-                      minLength={6}
-                      value={regPassword}
-                      onChange={(e) => setRegPassword(e.target.value)}
-                      placeholder="••••••••••••"
-                      className="mt-1.5 w-full rounded-md border border-slate-700 bg-[#0F172A] px-3.5 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:border-emerald-500 focus:outline-none"
-                    />
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={submitting}
-                    className="flex w-full items-center justify-center gap-2 rounded-md bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-50"
-                  >
-                    <UserPlus className="h-4 w-4" />
-                    <span>
-                      {submitting
-                        ? t('Создание аккаунта...', 'Creating account...')
-                        : t('Создать локальный аккаунт', 'Create Local Operator Account')}
-                    </span>
-                  </button>
-                </form>
-              )}
             </div>
           </div>
         </div>

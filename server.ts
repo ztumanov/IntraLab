@@ -595,60 +595,11 @@ export function createApp() {
     }
   });
 
-  app.post('/api/auth/local/register', async (req, res) => {
-    try {
-      const username = String(req.body?.username || '').trim();
-      const email = String(req.body?.email || '').trim().toLowerCase();
-      const password = String(req.body?.password || '');
-
-      if (!username || username.length < 3 || !/^[a-zA-Z0-9_.-]+$/.test(username)) {
-        return res.status(400).json({
-          error: 'Имя пользователя должно содержать минимум 3 символа (латиница, цифры, _.-)',
-        });
-      }
-      if (!email || !email.includes('@')) {
-        return res.status(400).json({ error: 'Укажите корректный email' });
-      }
-      if (!password || password.length < 6) {
-        return res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
-      }
-
-      const existingByUsername = await findLocalUserByIdentifier(username);
-      if (existingByUsername) {
-        return res.status(409).json({ error: 'Пользователь с таким логином уже существует' });
-      }
-      const existingByEmail = await findLocalUserByIdentifier(email);
-      if (existingByEmail) {
-        return res.status(409).json({ error: 'Пользователь с таким email уже существует' });
-      }
-
-      const passwordHash = hashPassword(password);
-      const created = await createLocalUserAccount({
-        username,
-        email,
-        passwordHash,
-      });
-
-      const token = signLocalSessionToken({
-        uid: created.uid,
-        email: created.email,
-        username: created.username,
-      });
-
-      return res.status(201).json({
-        token,
-        user: {
-          uid: created.uid,
-          email: created.email,
-          username: created.username,
-          totp_enabled: false,
-          auth_provider: 'local',
-        },
-      });
-    } catch (error: any) {
-      console.error('POST /api/auth/local/register failed:', error);
-      return res.status(500).json({ error: error.message || 'Ошибка регистрации' });
-    }
+  app.post('/api/auth/local/register', (_req, res) => {
+    return res.status(403).json({
+      error:
+        'Регистрация через веб-интерфейс отключена в целях безопасности. Создайте учётную запись администратора через команду: docker compose exec infralab npm run create-admin',
+    });
   });
 
   app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {

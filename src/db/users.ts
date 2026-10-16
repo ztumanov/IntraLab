@@ -2,11 +2,7 @@ import crypto from 'node:crypto';
 import { eq, or, sql } from 'drizzle-orm';
 import { db } from './index.ts';
 import { users } from './schema.ts';
-import {
-  DEFAULT_LOCAL_ADMIN_EMAIL,
-  DEFAULT_LOCAL_ADMIN_USERNAME,
-  ensureDatabaseSchema,
-} from './bootstrap.ts';
+import { ensureDatabaseSchema } from './bootstrap.ts';
 
 export async function getOrCreateUser(
   uid: string,
@@ -62,16 +58,7 @@ export async function findLocalUserByIdentifier(identifier: string) {
   };
 
   try {
-    let found = await queryUser();
-    if (
-      (!found || !found.passwordHash) &&
-      (clean === DEFAULT_LOCAL_ADMIN_USERNAME.toLowerCase() ||
-        clean === DEFAULT_LOCAL_ADMIN_EMAIL.toLowerCase())
-    ) {
-      await ensureDatabaseSchema();
-      found = await queryUser();
-    }
-    return found;
+    return await queryUser();
   } catch {
     await ensureDatabaseSchema();
     return await queryUser();

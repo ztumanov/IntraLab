@@ -12,7 +12,8 @@
     "lint": "tsc --noEmit",
     "test": "tsx --test --test-force-exit src/lib/validation.test.ts tests/localAuth.test.ts tests/agent.test.ts tests/monitoring.test.ts tests/logStreaming.test.ts tests/ansibleAutomation.test.ts",
     "check": "tsx scripts/check.ts",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "create-admin": "tsx scripts/create-admin.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

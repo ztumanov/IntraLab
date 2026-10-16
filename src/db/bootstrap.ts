@@ -252,7 +252,6 @@ export async function ensureDatabaseSchema(): Promise<void> {
   try {
     await pool.query(BOOTSTRAP_SQL);
   } catch {
-    // In managed Cloud SQL, DDL is applied via migrations/UpdateSchema; proceed to seed admin
+    // In managed Cloud SQL, DDL is applied via migrations/UpdateSchema
   }
-  await seedDefaultLocalAdmin();
 }
