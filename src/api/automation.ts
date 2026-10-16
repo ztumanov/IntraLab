@@ -44,11 +44,41 @@ export interface AnsiblePlaybook {
   content: string;
   validation_status: 'valid' | 'invalid' | 'unverified';
   validation_message: string;
+  last_inventory_id?: number | null;
+  last_inventory_name?: string | null;
+  last_job_id?: number | null;
   created_at: string;
   updated_at: string;
 }
 
 export type AnsibleJobStatus = 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILED' | 'CANCELLED';
+
+export type AnsibleHostExecutionStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'SUCCESS'
+  | 'FAILED'
+  | 'SKIPPED'
+  | 'CANCELLED';
+
+export interface AnsibleJobHostStatus {
+  job_id: number;
+  server_id: number;
+  server_name: string;
+  ip_address: string;
+  host_alias: string;
+  status: AnsibleHostExecutionStatus;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  ok_count: number;
+  changed_count: number;
+  failed_count: number;
+  unreachable_count: number;
+  skipped_count: number;
+  current_task: string;
+  error: string;
+}
 
 export interface AnsibleJob {
   id: number;
@@ -61,6 +91,11 @@ export interface AnsibleJob {
   diff_mode: boolean;
   tags: string[];
   extra_vars: Record<string, unknown>;
+  hosts: AnsibleJobHostStatus[];
+  current_task: string;
+  target_count: number;
+  completed_count: number;
+  failed_count: number;
   stdout: string;
   stderr: string;
   exit_code: number | null;
@@ -299,6 +334,7 @@ export async function fetchAnsibleJobById(id: number): Promise<AnsibleJob> {
 export async function startAnsibleJob(input: {
   playbook_id: number;
   inventory_id: number;
+  target_server_ids?: number[];
   check_mode?: boolean;
   diff_mode?: boolean;
   tags?: string[] | string;

@@ -205,6 +205,8 @@ export const ansibleJobs = pgTable('ansible_jobs', {
   diffMode: integer('diff_mode').default(0).notNull(),
   tags: text('tags').default('').notNull(),
   extraVarsJson: text('extra_vars_json').default('{}').notNull(),
+  hostsJson: text('hosts_json').default('[]').notNull(),
+  currentTask: text('current_task').default('').notNull(),
   stdout: text('stdout').default('').notNull(),
   stderr: text('stderr').default('').notNull(),
   exitCode: integer('exit_code'),

@@ -159,6 +159,7 @@ export function useStartAnsibleJob() {
     mutationFn: startAnsibleJob,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['automation', 'jobs'] });
+      queryClient.invalidateQueries({ queryKey: ['automation', 'playbooks'] });
       queryClient.invalidateQueries({ queryKey: ['automation', 'audit-logs'] });
     },
   });

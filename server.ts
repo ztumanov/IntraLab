@@ -71,6 +71,7 @@ import {
 } from './src/server/sftpManager.ts';
 import {
   addServerToInventory,
+  computeHostSummaryCounts,
   createInventoryRecord,
   createPlaybookRecord,
   deleteInventoryById,
@@ -3109,9 +3110,14 @@ WantedBy=multi-user.target
 
       const active = ansibleJobManager.getActiveJob(id);
       if (active) {
+        const activeHosts = active.hosts.length > 0 ? active.hosts : job.hosts;
+        const counts = computeHostSummaryCounts(activeHosts);
         return res.status(200).json({
           ...job,
           status: active.status,
+          hosts: activeHosts,
+          current_task: active.currentTask || job.current_task,
+          ...counts,
           stdout: active.stdout || job.stdout,
           stderr: active.stderr || job.stderr,
         });
@@ -3129,6 +3135,11 @@ WantedBy=multi-user.target
       const uid = req.user!.uid;
       const playbookId = Number(req.body?.playbook_id);
       const inventoryId = Number(req.body?.inventory_id);
+      const targetServerIds = Array.isArray(req.body?.target_server_ids)
+        ? req.body.target_server_ids
+            .map((id: any) => Number(id))
+            .filter((id: number) => Number.isInteger(id) && id > 0)
+        : undefined;
       const checkMode = Boolean(req.body?.check_mode);
       const diffMode = Boolean(req.body?.diff_mode);
       const tags = req.body?.tags;
@@ -3145,6 +3156,7 @@ WantedBy=multi-user.target
         userUid: uid,
         playbookId,
         inventoryId,
+        targetServerIds,
         checkMode,
         diffMode,
         tags,
@@ -3212,11 +3224,17 @@ WantedBy=multi-user.target
       const initialStatus = active ? active.status : job.status;
       const initialStdout = active ? active.stdout : job.stdout;
       const initialStderr = active ? active.stderr : job.stderr;
+      const initialHosts = active && active.hosts.length > 0 ? active.hosts : job.hosts;
+      const initialCurrentTask = active ? active.currentTask : job.current_task;
+      const initialCounts = computeHostSummaryCounts(initialHosts);
 
       res.write(
         `event: snapshot\ndata: ${JSON.stringify({
           id: job.id,
           status: initialStatus,
+          hosts: initialHosts,
+          current_task: initialCurrentTask,
+          ...initialCounts,
           stdout: initialStdout,
           stderr: initialStderr,
           exit_code: job.exit_code,
@@ -3228,6 +3246,9 @@ WantedBy=multi-user.target
         res.write(
           `event: done\ndata: ${JSON.stringify({
             status: initialStatus,
+            hosts: initialHosts,
+            current_task: '',
+            ...initialCounts,
             exit_code: job.exit_code,
             duration_ms: job.duration_ms,
           })}\n\n`

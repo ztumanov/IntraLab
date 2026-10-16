@@ -67,6 +67,8 @@ export async function ensureAutomationTables(): Promise<void> {
         finished_at TIMESTAMP,
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
       );
+      ALTER TABLE ansible_jobs ADD COLUMN IF NOT EXISTS hosts_json TEXT NOT NULL DEFAULT '[]';
+      ALTER TABLE ansible_jobs ADD COLUMN IF NOT EXISTS current_task TEXT NOT NULL DEFAULT '';
       CREATE TABLE IF NOT EXISTS automation_audit_logs (
         id SERIAL PRIMARY KEY,
         event_type TEXT NOT NULL,
@@ -443,11 +445,17 @@ export interface PlaybookView {
   content: string;
   validation_status: 'valid' | 'invalid' | 'unverified';
   validation_message: string;
+  last_inventory_id?: number | null;
+  last_inventory_name?: string | null;
+  last_job_id?: number | null;
   created_at: string;
   updated_at: string;
 }
 
-function serializePlaybook(row: typeof ansiblePlaybooks.$inferSelect): PlaybookView {
+function serializePlaybook(
+  row: typeof ansiblePlaybooks.$inferSelect,
+  lastJob?: { id: number; inventoryId: number | null; inventoryName: string }
+): PlaybookView {
   const status =
     row.validationStatus === 'valid' || row.validationStatus === 'invalid'
       ? row.validationStatus
@@ -460,6 +468,9 @@ function serializePlaybook(row: typeof ansiblePlaybooks.$inferSelect): PlaybookV
     content: row.content,
     validation_status: status,
     validation_message: row.validationMessage,
+    last_inventory_id: lastJob?.inventoryId ?? null,
+    last_inventory_name: lastJob?.inventoryName ?? null,
+    last_job_id: lastJob?.id ?? null,
     created_at: row.createdAt.toISOString(),
     updated_at: row.updatedAt.toISOString(),
   };
@@ -474,7 +485,47 @@ export async function listPlaybooksByUser(userUid: string): Promise<PlaybookView
         .from(ansiblePlaybooks)
         .where(eq(ansiblePlaybooks.userUid, userUid))
         .orderBy(desc(ansiblePlaybooks.updatedAt));
-  return rows.map(serializePlaybook);
+
+  if (rows.length === 0) return [];
+
+  const jobRows = isLocalAdmin(userUid)
+    ? await db
+        .select({
+          id: ansibleJobs.id,
+          playbookId: ansibleJobs.playbookId,
+          inventoryId: ansibleJobs.inventoryId,
+          inventoryName: ansibleJobs.inventoryName,
+        })
+        .from(ansibleJobs)
+        .orderBy(desc(ansibleJobs.createdAt))
+        .limit(200)
+    : await db
+        .select({
+          id: ansibleJobs.id,
+          playbookId: ansibleJobs.playbookId,
+          inventoryId: ansibleJobs.inventoryId,
+          inventoryName: ansibleJobs.inventoryName,
+        })
+        .from(ansibleJobs)
+        .where(eq(ansibleJobs.createdBy, userUid))
+        .orderBy(desc(ansibleJobs.createdAt))
+        .limit(200);
+
+  const latestByPlaybook = new Map<
+    number,
+    { id: number; inventoryId: number | null; inventoryName: string }
+  >();
+  for (const j of jobRows) {
+    if (j.playbookId && !latestByPlaybook.has(j.playbookId)) {
+      latestByPlaybook.set(j.playbookId, {
+        id: j.id,
+        inventoryId: j.inventoryId,
+        inventoryName: j.inventoryName,
+      });
+    }
+  }
+
+  return rows.map((row) => serializePlaybook(row, latestByPlaybook.get(row.id)));
 }
 
 export async function getPlaybookById(id: number, userUid: string): Promise<PlaybookView | null> {
@@ -566,6 +617,33 @@ export async function deletePlaybookById(id: number, userUid: string): Promise<b
 
 export type AnsibleJobStatus = 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILED' | 'CANCELLED';
 
+export type AnsibleHostExecutionStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'SUCCESS'
+  | 'FAILED'
+  | 'SKIPPED'
+  | 'CANCELLED';
+
+export interface AnsibleJobHostStatus {
+  job_id: number;
+  server_id: number;
+  server_name: string;
+  ip_address: string;
+  host_alias: string;
+  status: AnsibleHostExecutionStatus;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  ok_count: number;
+  changed_count: number;
+  failed_count: number;
+  unreachable_count: number;
+  skipped_count: number;
+  current_task: string;
+  error: string;
+}
+
 export interface AnsibleJobView {
   id: number;
   playbook_id: number | null;
@@ -577,6 +655,11 @@ export interface AnsibleJobView {
   diff_mode: boolean;
   tags: string[];
   extra_vars: Record<string, unknown>;
+  hosts: AnsibleJobHostStatus[];
+  current_task: string;
+  target_count: number;
+  completed_count: number;
+  failed_count: number;
   stdout: string;
   stderr: string;
   exit_code: number | null;
@@ -587,6 +670,20 @@ export interface AnsibleJobView {
   created_at: string;
 }
 
+export function computeHostSummaryCounts(hosts: AnsibleJobHostStatus[]) {
+  const target_count = hosts.length;
+  let completed_count = 0;
+  let failed_count = 0;
+  for (const h of hosts) {
+    if (h.status === 'SUCCESS' || h.status === 'SKIPPED') {
+      completed_count++;
+    } else if (h.status === 'FAILED') {
+      failed_count++;
+    }
+  }
+  return { target_count, completed_count, failed_count };
+}
+
 function serializeJob(row: typeof ansibleJobs.$inferSelect, includeOutput = true): AnsibleJobView {
   let extraVars: Record<string, unknown> = {};
   try {
@@ -594,10 +691,25 @@ function serializeJob(row: typeof ansibleJobs.$inferSelect, includeOutput = true
   } catch {
     extraVars = {};
   }
+  let hosts: AnsibleJobHostStatus[] = [];
+  try {
+    const parsed = JSON.parse(row.hostsJson || '[]');
+    if (Array.isArray(parsed)) {
+      hosts = parsed.map((h: any) => ({
+        ...h,
+        job_id: row.id,
+      }));
+    }
+  } catch {
+    hosts = [];
+  }
+
   const tags = (row.tags || '')
     .split(',')
     .map((t) => t.trim())
     .filter(Boolean);
+
+  const { target_count, completed_count, failed_count } = computeHostSummaryCounts(hosts);
 
   return {
     id: row.id,
@@ -610,6 +722,11 @@ function serializeJob(row: typeof ansibleJobs.$inferSelect, includeOutput = true
     diff_mode: row.diffMode === 1,
     tags,
     extra_vars: extraVars,
+    hosts,
+    current_task: row.currentTask || '',
+    target_count,
+    completed_count,
+    failed_count,
     stdout: includeOutput ? row.stdout : '',
     stderr: includeOutput ? row.stderr : '',
     exit_code: row.exitCode ?? null,
@@ -630,6 +747,7 @@ export async function createAnsibleJobRecord(params: {
   diffMode: boolean;
   tags: string[];
   redactedExtraVars: Record<string, unknown>;
+  initialHosts: Omit<AnsibleJobHostStatus, 'job_id'>[];
   createdBy: string;
 }): Promise<AnsibleJobView> {
   await ensureAutomationTables();
@@ -645,10 +763,61 @@ export async function createAnsibleJobRecord(params: {
       diffMode: params.diffMode ? 1 : 0,
       tags: params.tags.join(','),
       extraVarsJson: JSON.stringify(params.redactedExtraVars || {}),
+      hostsJson: JSON.stringify(params.initialHosts || []),
+      currentTask: '',
       createdBy: params.createdBy,
     })
     .returning();
   return serializeJob(inserted, true);
+}
+
+async function backfillMissingJobHostsFromInventory(
+  jobView: AnsibleJobView,
+  userUid: string
+): Promise<AnsibleJobView> {
+  if (jobView.hosts.length > 0 || !jobView.inventory_id) {
+    return jobView;
+  }
+  const inv = await getInventoryById(jobView.inventory_id, userUid);
+  if (!inv || inv.servers.length === 0) {
+    return jobView;
+  }
+  const fallbackStatus: AnsibleHostExecutionStatus =
+    jobView.status === 'SUCCESS'
+      ? 'SUCCESS'
+      : jobView.status === 'FAILED'
+      ? 'FAILED'
+      : jobView.status === 'CANCELLED'
+      ? 'CANCELLED'
+      : jobView.status === 'RUNNING'
+      ? 'RUNNING'
+      : 'PENDING';
+
+  const fallbackHosts: AnsibleJobHostStatus[] = inv.servers.map((srv) => ({
+    job_id: jobView.id,
+    server_id: srv.id,
+    server_name: srv.name,
+    ip_address: srv.ip_address,
+    host_alias: `${srv.name}-${srv.id}`,
+    status: fallbackStatus,
+    started_at: jobView.started_at,
+    finished_at: jobView.finished_at,
+    duration_ms: jobView.duration_ms || null,
+    ok_count: fallbackStatus === 'SUCCESS' ? 1 : 0,
+    changed_count: 0,
+    failed_count: fallbackStatus === 'FAILED' ? 1 : 0,
+    unreachable_count: 0,
+    skipped_count: 0,
+    current_task: '',
+    error: fallbackStatus === 'FAILED' ? jobView.stderr || 'Task execution failed' : '',
+  }));
+
+  const counts = computeHostSummaryCounts(fallbackHosts);
+  return {
+    ...jobView,
+    hosts: fallbackHosts,
+    ...counts,
+  };
 }
 
 export async function getAnsibleJobById(
@@ -664,7 +833,9 @@ export async function getAnsibleJobById(
         ? eq(ansibleJobs.id, id)
         : and(eq(ansibleJobs.id, id), eq(ansibleJobs.createdBy, userUid))
     );
-  return rows[0] ? serializeJob(rows[0], true) : null;
+  if (!rows[0]) return null;
+  const serialized = serializeJob(rows[0], true);
+  return backfillMissingJobHostsFromInventory(serialized, userUid);
 }
 
 export async function listAnsibleJobsByUser(
@@ -714,13 +885,20 @@ export async function listAnsibleJobsByUser(
           .limit(100)
       : await db.select().from(ansibleJobs).orderBy(desc(ansibleJobs.createdAt)).limit(100);
 
-  return rows.map((r) => serializeJob(r, false));
+  const views = rows.map((r) => serializeJob(r, false));
+  const result: AnsibleJobView[] = [];
+  for (const v of views) {
+    result.push(await backfillMissingJobHostsFromInventory(v, userUid));
+  }
+  return result;
 }
 
 export async function updateAnsibleJobState(
   id: number,
   patch: {
     status?: AnsibleJobStatus;
+    hosts?: AnsibleJobHostStatus[];
+    currentTask?: string;
     stdout?: string;
     stderr?: string;
     exitCode?: number | null;
@@ -732,6 +910,8 @@ export async function updateAnsibleJobState(
   await ensureAutomationTables();
   const updateData: Record<string, any> = {};
   if (patch.status !== undefined) updateData.status = patch.status;
+  if (patch.hosts !== undefined) updateData.hostsJson = JSON.stringify(patch.hosts);
+  if (patch.currentTask !== undefined) updateData.currentTask = patch.currentTask;
   if (patch.stdout !== undefined) updateData.stdout = patch.stdout;
   if (patch.stderr !== undefined) updateData.stderr = patch.stderr;
   if (patch.exitCode !== undefined) updateData.exitCode = patch.exitCode;

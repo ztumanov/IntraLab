@@ -6,8 +6,10 @@ import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import { decryptSecret } from './sshConnector.ts';
 import {
+  AnsibleJobHostStatus,
   AnsibleJobStatus,
   AnsibleJobView,
+  computeHostSummaryCounts,
   createAnsibleJobRecord,
   createAutomationAuditLogRecord,
   createPlaybookRecord,
@@ -60,14 +62,43 @@ const FORBIDDEN_EXTRA_VAR_KEYS = new Set([
   'ansible_ssh_private_key_file',
 ]);
 
+function resolveBinaryPath(envValue: string | undefined, binaryName: string, fallbackPath: string): string {
+  if (envValue && envValue.trim()) {
+    return envValue.trim();
+  }
+  const searchDirs = [
+    '/usr/bin',
+    '/usr/local/bin',
+    '/bin',
+    ...(process.env.PATH ? process.env.PATH.split(path.delimiter) : []),
+  ];
+  for (const dir of searchDirs) {
+    if (!dir) continue;
+    const candidate = path.join(dir, binaryName);
+    try {
+      if (fs.statSync(candidate).isFile()) {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      }
+    } catch {
+      // Continue searching
+    }
+  }
+  return fallbackPath;
+}
+
 export function getAnsibleConfig(): AnsibleRuntimeConfig {
-  const ansibleBin = (process.env.ANSIBLE_BIN || '/usr/bin/ansible').trim();
-  const ansiblePlaybookBin = (
-    process.env.ANSIBLE_PLAYBOOK_BIN || '/usr/bin/ansible-playbook'
-  ).trim();
-  const ansibleInventoryBin = (
-    process.env.ANSIBLE_INVENTORY_BIN || '/usr/bin/ansible-inventory'
-  ).trim();
+  const ansibleBin = resolveBinaryPath(process.env.ANSIBLE_BIN, 'ansible', '/usr/bin/ansible');
+  const ansiblePlaybookBin = resolveBinaryPath(
+    process.env.ANSIBLE_PLAYBOOK_BIN,
+    'ansible-playbook',
+    '/usr/bin/ansible-playbook'
+  );
+  const ansibleInventoryBin = resolveBinaryPath(
+    process.env.ANSIBLE_INVENTORY_BIN,
+    'ansible-inventory',
+    '/usr/bin/ansible-inventory'
+  );
   const timeoutRaw = Number(process.env.ANSIBLE_TIMEOUT || 120);
   const timeoutSec =
     Number.isFinite(timeoutRaw) && timeoutRaw >= 5 && timeoutRaw <= 3600
@@ -606,6 +637,13 @@ export function buildInventoryIniAndSecrets(params: {
   };
 }
 
+export function computeHostAlias(srv: { id: number; name: string; hostname: string }): string {
+  return sanitizeIniIdentifier(
+    `${srv.name || srv.hostname}-${srv.id}`,
+    `server-${srv.id}`
+  );
+}
+
 interface ActiveJobExecution {
   jobId: number;
   userUid: string;
@@ -616,6 +654,137 @@ interface ActiveJobExecution {
   stdout: string;
   stderr: string;
   status: AnsibleJobStatus;
+  hosts: AnsibleJobHostStatus[];
+  currentTask: string;
+  lineBuffer: string;
+}
+
+function parseAnsibleLineIntoHosts(
+  rawLine: string,
+  activeExec: ActiveJobExecution,
+  jobStartTimeMs: number
+): boolean {
+  const line = rawLine.trim();
+  if (!line) return false;
+  const nowIso = new Date().toISOString();
+
+  // 1. Match TASK [Task Name] ***
+  const taskMatch = line.match(/^TASK\s+\[([^\]]+)\]/);
+  if (taskMatch) {
+    const taskName = taskMatch[1].trim();
+    activeExec.currentTask = taskName;
+    for (const h of activeExec.hosts) {
+      if (h.status === 'PENDING' || h.status === 'RUNNING') {
+        h.status = 'RUNNING';
+        h.current_task = taskName;
+        if (!h.started_at) {
+          h.started_at = nowIso;
+        }
+      }
+    }
+    return true;
+  }
+
+  // 2. Match per-host task status: ok / changed / skipping / fatal / failed
+  const hostEventMatch = line.match(
+    /^(ok|changed|skipping|fatal|failed):\s*\[([^\]]+)\](?::\s*(UNREACHABLE|FAILED)!\s*=>\s*(.*)|(?:\s*=>\s*(.*))?)?$/
+  );
+  if (hostEventMatch) {
+    const [, verb, rawHost, failKind, failPayload, regularPayload] = hostEventMatch;
+    const hostAlias = rawHost.trim();
+    const target = activeExec.hosts.find(
+      (h) => h.host_alias === hostAlias || h.server_name === hostAlias || h.ip_address === hostAlias
+    );
+    if (target) {
+      if (!target.started_at) {
+        target.started_at = nowIso;
+      }
+      if (verb === 'ok') {
+        target.ok_count += 1;
+        if (target.status === 'PENDING') target.status = 'RUNNING';
+      } else if (verb === 'changed') {
+        target.changed_count += 1;
+        if (target.status === 'PENDING') target.status = 'RUNNING';
+      } else if (verb === 'skipping') {
+        target.skipped_count += 1;
+        if (target.status === 'PENDING') target.status = 'RUNNING';
+      } else if (verb === 'fatal' || verb === 'failed') {
+        if (failKind === 'UNREACHABLE') {
+          target.unreachable_count += 1;
+        } else {
+          target.failed_count += 1;
+        }
+        target.status = 'FAILED';
+        target.finished_at = nowIso;
+        const startMs = target.started_at
+          ? new Date(target.started_at).getTime()
+          : jobStartTimeMs;
+        target.duration_ms = Math.max(1, Date.now() - startMs);
+
+        const rawJson = (failPayload || regularPayload || '').trim();
+        let extractedError = '';
+        if (rawJson.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(rawJson);
+            extractedError =
+              parsed.msg || parsed.stderr || parsed.stdout || rawJson.slice(0, 240);
+          } catch {
+            extractedError = rawJson.slice(0, 240);
+          }
+        } else {
+          extractedError = rawJson.slice(0, 240) || `${failKind || 'FAILED'} on ${target.server_name}`;
+        }
+        target.error = extractedError;
+      }
+      return true;
+    }
+  }
+
+  // 3. Match PLAY RECAP line:
+  // hostAlias : ok=2 changed=1 unreachable=0 failed=0 skipped=0 rescued=0 ignored=0
+  const recapMatch = line.match(
+    /^([a-zA-Z0-9_.-]+)\s*:\s*ok=(\d+)\s+changed=(\d+)\s+unreachable=(\d+)\s+failed=(\d+)\s+skipped=(\d+)/
+  );
+  if (recapMatch) {
+    const [, alias, okStr, changedStr, unreachStr, failedStr, skippedStr] = recapMatch;
+    const target = activeExec.hosts.find(
+      (h) => h.host_alias === alias || h.server_name === alias || h.ip_address === alias
+    );
+    if (target) {
+      target.ok_count = Number(okStr);
+      target.changed_count = Number(changedStr);
+      target.unreachable_count = Number(unreachStr);
+      target.failed_count = Number(failedStr);
+      target.skipped_count = Number(skippedStr);
+      target.current_task = '';
+      target.finished_at = target.finished_at || nowIso;
+      const startMs = target.started_at
+        ? new Date(target.started_at).getTime()
+        : jobStartTimeMs;
+      target.duration_ms = target.duration_ms || Math.max(1, Date.now() - startMs);
+
+      if (target.failed_count > 0 || target.unreachable_count > 0) {
+        target.status = 'FAILED';
+        if (!target.error) {
+          target.error =
+            target.unreachable_count > 0
+              ? 'SSH connection unreachable'
+              : 'Task failed during playbook execution';
+        }
+      } else if (
+        target.ok_count === 0 &&
+        target.changed_count === 0 &&
+        target.skipped_count > 0
+      ) {
+        target.status = 'SKIPPED';
+      } else {
+        target.status = 'SUCCESS';
+      }
+      return true;
+    }
+  }
+
+  return false;
 }
 
 class AnsibleJobManager {
@@ -652,6 +821,7 @@ class AnsibleJobManager {
     userUid: string;
     playbookId: number;
     inventoryId: number;
+    targetServerIds?: number[];
     checkMode?: boolean;
     diffMode?: boolean;
     tags?: unknown;
@@ -677,14 +847,25 @@ class AnsibleJobManager {
       throw new Error('Inventory not found');
     }
 
-    const serverRecords = await getInventoryFullServerRecords(
+    const allInventoryServerRecords = await getInventoryFullServerRecords(
       params.inventoryId,
       params.userUid
     );
-    if (serverRecords.length === 0) {
+    if (allInventoryServerRecords.length === 0) {
       throw new Error(
         'Selected Ansible Inventory has no servers assigned. Add at least one server to run the playbook.'
       );
+    }
+
+    let serverRecords = allInventoryServerRecords;
+    if (Array.isArray(params.targetServerIds) && params.targetServerIds.length > 0) {
+      const requestedSet = new Set(
+        params.targetServerIds.filter((id) => Number.isInteger(id) && id > 0)
+      );
+      serverRecords = allInventoryServerRecords.filter((s) => requestedSet.has(s.id));
+      if (serverRecords.length === 0) {
+        throw new Error('None of the selected target servers belong to the chosen inventory');
+      }
     }
 
     const tagsResult = validateAndNormalizeTags(params.tags);
@@ -700,6 +881,25 @@ class AnsibleJobManager {
     const checkMode = Boolean(params.checkMode);
     const diffMode = Boolean(params.diffMode);
 
+    const initialHostsWithoutJobId: Omit<AnsibleJobHostStatus, 'job_id'>[] =
+      serverRecords.map((s) => ({
+        server_id: s.id,
+        server_name: s.name,
+        ip_address: s.ipAddress,
+        host_alias: computeHostAlias(s),
+        status: 'PENDING',
+        started_at: null,
+        finished_at: null,
+        duration_ms: null,
+        ok_count: 0,
+        changed_count: 0,
+        failed_count: 0,
+        unreachable_count: 0,
+        skipped_count: 0,
+        current_task: '',
+        error: '',
+      }));
+
     const jobRecord = await createAnsibleJobRecord({
       playbookId: playbook.id,
       playbookName: playbook.name,
@@ -709,6 +909,7 @@ class AnsibleJobManager {
       diffMode,
       tags: tagsResult.tags,
       redactedExtraVars: varsResult.redactedVars,
+      initialHosts: initialHostsWithoutJobId,
       createdBy: params.userUid,
     });
 
@@ -731,6 +932,9 @@ class AnsibleJobManager {
       stdout: '',
       stderr: '',
       status: 'PENDING',
+      hosts: jobRecord.hosts.map((h) => ({ ...h })),
+      currentTask: '',
+      lineBuffer: '',
     };
 
     this.activeJobs.set(jobRecord.id, activeExec);
@@ -778,8 +982,13 @@ class AnsibleJobManager {
 
     try {
       activeExec.status = 'RUNNING';
+      for (const h of activeExec.hosts) {
+        h.status = 'RUNNING';
+        h.started_at = startedAt.toISOString();
+      }
       await updateAnsibleJobState(activeExec.jobId, {
         status: 'RUNNING',
+        hosts: activeExec.hosts,
         startedAt,
       });
 
@@ -796,6 +1005,8 @@ class AnsibleJobManager {
       activeExec.emitter.emit('status', {
         status: 'RUNNING',
         started_at: startedAt.toISOString(),
+        hosts: activeExec.hosts,
+        current_task: activeExec.currentTask,
       });
 
       const { inventoryPath, secretsToRedact } = buildInventoryIniAndSecrets({
@@ -884,10 +1095,12 @@ class AnsibleJobManager {
       let lastFlushMs = Date.now();
       const maybeFlushProgress = async () => {
         const now = Date.now();
-        if (now - lastFlushMs < 800) return;
+        if (now - lastFlushMs < 600) return;
         lastFlushMs = now;
         try {
           await updateAnsibleJobState(activeExec.jobId, {
+            hosts: activeExec.hosts,
+            currentTask: activeExec.currentTask,
             stdout: activeExec.stdout,
             stderr: activeExec.stderr,
             durationMs: Math.max(1, now - startTime),
@@ -905,11 +1118,31 @@ class AnsibleJobManager {
             MAX_JOB_OUTPUT_CHARS - activeExec.stdout.length
           );
         }
+
+        activeExec.lineBuffer += cleanChunk;
+        const lines = activeExec.lineBuffer.split('\n');
+        activeExec.lineBuffer = lines.pop() || '';
+        let hostsUpdated = false;
+        for (const l of lines) {
+          if (parseAnsibleLineIntoHosts(l, activeExec, startTime)) {
+            hostsUpdated = true;
+          }
+        }
+
         activeExec.emitter.emit('output', {
           stream: 'stdout',
           chunk: cleanChunk,
+          hosts: activeExec.hosts,
+          current_task: activeExec.currentTask,
           timestamp: new Date().toISOString(),
         });
+        if (hostsUpdated) {
+          activeExec.emitter.emit('status', {
+            status: activeExec.status,
+            hosts: activeExec.hosts,
+            current_task: activeExec.currentTask,
+          });
+        }
         void maybeFlushProgress();
       });
 
@@ -924,6 +1157,8 @@ class AnsibleJobManager {
         activeExec.emitter.emit('output', {
           stream: 'stderr',
           chunk: cleanChunk,
+          hosts: activeExec.hosts,
+          current_task: activeExec.currentTask,
           timestamp: new Date().toISOString(),
         });
         void maybeFlushProgress();
@@ -951,6 +1186,12 @@ class AnsibleJobManager {
 
       clearTimeout(timeoutTimer);
 
+      // Flush any trailing line in lineBuffer
+      if (activeExec.lineBuffer.trim()) {
+        parseAnsibleLineIntoHosts(activeExec.lineBuffer, activeExec, startTime);
+        activeExec.lineBuffer = '';
+      }
+
       // Immediately purge ephemeral SSH keys, inventory, and playbook files on process exit
       try {
         fs.rmSync(jobDir, { recursive: true, force: true });
@@ -959,6 +1200,7 @@ class AnsibleJobManager {
       }
 
       const finishedAt = new Date();
+      const finishedIso = finishedAt.toISOString();
       const durationMs = Math.max(1, Date.now() - startTime);
 
       let finalStatus: AnsibleJobStatus = 'SUCCESS';
@@ -969,7 +1211,7 @@ class AnsibleJobManager {
         activeExec.emitter.emit('output', {
           stream: 'stderr',
           chunk: cancelMsg,
-          timestamp: finishedAt.toISOString(),
+          timestamp: finishedIso,
         });
       } else if (activeExec.timedOut) {
         finalStatus = 'FAILED';
@@ -978,14 +1220,50 @@ class AnsibleJobManager {
         activeExec.emitter.emit('output', {
           stream: 'stderr',
           chunk: timeoutMsg,
-          timestamp: finishedAt.toISOString(),
+          timestamp: finishedIso,
         });
       } else if (exitCode !== 0) {
         finalStatus = 'FAILED';
       }
 
+      activeExec.currentTask = '';
+      for (const h of activeExec.hosts) {
+        h.current_task = '';
+        if (!h.finished_at) {
+          h.finished_at = finishedIso;
+        }
+        if (!h.duration_ms) {
+          const hStart = h.started_at ? new Date(h.started_at).getTime() : startTime;
+          h.duration_ms = Math.max(1, Date.now() - hStart);
+        }
+        if (finalStatus === 'CANCELLED') {
+          if (h.status === 'PENDING' || h.status === 'RUNNING') {
+            h.status = 'CANCELLED';
+          }
+        } else if (finalStatus === 'SUCCESS') {
+          if (h.status === 'PENDING' || h.status === 'RUNNING') {
+            h.status = 'SUCCESS';
+          }
+        } else if (finalStatus === 'FAILED') {
+          if (h.status === 'PENDING' || h.status === 'RUNNING') {
+            h.status = 'FAILED';
+            if (!h.error) {
+              h.error =
+                (activeExec.stderr || activeExec.stdout || 'Playbook execution failed')
+                  .trim()
+                  .split('\n')
+                  .slice(-2)
+                  .join(' ')
+                  .slice(0, 240);
+            }
+          }
+        }
+      }
+
       await updateAnsibleJobState(activeExec.jobId, {
         status: finalStatus,
+        hosts: activeExec.hosts,
+        currentTask: '',
         stdout: activeExec.stdout,
         stderr: activeExec.stderr,
         exitCode,
@@ -1012,21 +1290,39 @@ class AnsibleJobManager {
 
       activeExec.status = finalStatus;
 
+      const summaryCounts = computeHostSummaryCounts(activeExec.hosts);
       activeExec.emitter.emit('done', {
         status: finalStatus,
         exit_code: exitCode,
         duration_ms: durationMs,
-        finished_at: finishedAt.toISOString(),
+        finished_at: finishedIso,
+        hosts: activeExec.hosts,
+        current_task: '',
+        ...summaryCounts,
       });
     } catch (err: any) {
       const finishedAt = new Date();
+      const finishedIso = finishedAt.toISOString();
       const durationMs = Math.max(1, Date.now() - startTime);
       const errMsg = err?.message || 'Unexpected error during Ansible job execution';
       activeExec.stderr += `\n${errMsg}\n`;
       activeExec.status = 'FAILED';
+      activeExec.currentTask = '';
+
+      for (const h of activeExec.hosts) {
+        h.current_task = '';
+        if (h.status === 'PENDING' || h.status === 'RUNNING') {
+          h.status = 'FAILED';
+          h.finished_at = finishedIso;
+          h.duration_ms = durationMs;
+          h.error = errMsg;
+        }
+      }
 
       await updateAnsibleJobState(activeExec.jobId, {
         status: 'FAILED',
+        hosts: activeExec.hosts,
+        currentTask: '',
         stdout: activeExec.stdout,
         stderr: activeExec.stderr,
         exitCode: 255,
@@ -1044,11 +1340,15 @@ class AnsibleJobManager {
         result: `FAILED: ${errMsg}`,
       });
 
+      const summaryCounts = computeHostSummaryCounts(activeExec.hosts);
       activeExec.emitter.emit('done', {
         status: 'FAILED',
         exit_code: 255,
         duration_ms: durationMs,
-        finished_at: finishedAt.toISOString(),
+        finished_at: finishedIso,
+        hosts: activeExec.hosts,
+        current_task: '',
+        ...summaryCounts,
       });
     } finally {
       this.activeJobs.delete(activeExec.jobId);

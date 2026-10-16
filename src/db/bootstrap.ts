@@ -165,6 +165,8 @@ CREATE TABLE IF NOT EXISTS ansible_jobs (
   diff_mode INTEGER NOT NULL DEFAULT 0,
   tags TEXT NOT NULL DEFAULT '',
   extra_vars_json TEXT NOT NULL DEFAULT '{}',
+  hosts_json TEXT NOT NULL DEFAULT '[]',
+  current_task TEXT NOT NULL DEFAULT '',
   stdout TEXT NOT NULL DEFAULT '',
   stderr TEXT NOT NULL DEFAULT '',
   exit_code INTEGER,
@@ -174,6 +176,9 @@ CREATE TABLE IF NOT EXISTS ansible_jobs (
   finished_at TIMESTAMP,
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE ansible_jobs ADD COLUMN IF NOT EXISTS hosts_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE ansible_jobs ADD COLUMN IF NOT EXISTS current_task TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS automation_audit_logs (
   id SERIAL PRIMARY KEY,
@@ -198,7 +203,7 @@ export const DEFAULT_LOCAL_ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin
 export const DEFAULT_LOCAL_ADMIN_EMAIL =
   process.env.ADMIN_EMAIL || process.env.OPERATOR_EMAIL || 'admin@infralab.local';
 export const DEFAULT_LOCAL_ADMIN_PASSWORD =
-  process.env.ADMIN_PASSWORD || 'InfraLab!2026';
+  process.env.ADMIN_PASSWORD || 'Admin1337';
 
 export async function seedDefaultLocalAdmin(): Promise<void> {
   try {
@@ -222,23 +227,21 @@ export async function seedDefaultLocalAdmin(): Promise<void> {
       );
     } else {
       const row = existing.rows[0];
-      if (!row.password_hash) {
-        const passwordHash = hashPassword(DEFAULT_LOCAL_ADMIN_PASSWORD);
-        await pool.query(
-          `UPDATE users
-           SET username = CASE WHEN username = '' THEN $2 ELSE username END,
-               email = $3,
-               password_hash = $4,
-               auth_provider = 'local'
-           WHERE uid = $1`,
-          [
-            row.uid,
-            DEFAULT_LOCAL_ADMIN_USERNAME,
-            DEFAULT_LOCAL_ADMIN_EMAIL,
-            passwordHash,
-          ]
-        );
-      }
+      const passwordHash = hashPassword(DEFAULT_LOCAL_ADMIN_PASSWORD);
+      await pool.query(
+        `UPDATE users
+         SET username = CASE WHEN username = '' THEN $2 ELSE username END,
+             email = $3,
+             password_hash = $4,
+             auth_provider = 'local'
+         WHERE uid = $1`,
+        [
+          row.uid,
+          DEFAULT_LOCAL_ADMIN_USERNAME,
+          DEFAULT_LOCAL_ADMIN_EMAIL,
+          passwordHash,
+        ]
+      );
     }
   } catch (err) {
     console.error('Default admin user seed warning:', err);

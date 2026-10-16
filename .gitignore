@@ -10,4 +10,7 @@ coverage/
 *.pem
 *.crt
 pki/
+bin/
+.ansible/
+
 

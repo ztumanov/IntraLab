@@ -3,6 +3,11 @@ services:
     image: postgres:16-alpine
     container_name: infralab-postgres
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-infralab}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-infralab_secret}
@@ -21,6 +26,11 @@ services:
     image: prom/prometheus:v2.54.1
     container_name: infralab-prometheus
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -41,6 +51,11 @@ services:
         VITE_GOOGLE_MAPS_API_KEY: ${VITE_GOOGLE_MAPS_API_KEY:-}
     container_name: infralab-app
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,7 +75,7 @@ services:
       PROMETHEUS_URL: http://prometheus:9090
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@infralab.local}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-InfraLab!2026}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin1337}
       OPERATOR_EMAIL: ${OPERATOR_EMAIL:-admin@infralab.local}
       AGENT_CERT_TTL_HOURS: ${AGENT_CERT_TTL_HOURS:-72}
       AGENT_PKI_DIR: /var/lib/infralab/pki

@@ -372,7 +372,7 @@ test('Ansible Automation Module: Security, Validation, Inventory, Real ansible-p
       'Secret extra_vars must never leak in output'
     );
 
-    // 13. Verify persisted Job Details & Audit Logs
+    // 13. Verify persisted Job Details & Per-Server Host Statuses
     const jobDetailRes = await fetch(
       `${baseUrl}/api/automation/jobs/${startedJob.id}`,
       { headers: authHeaders }
@@ -382,6 +382,21 @@ test('Ansible Automation Module: Security, Validation, Inventory, Real ansible-p
     assert.equal(jobDetail.status, 'SUCCESS');
     assert.equal(jobDetail.exit_code, 0);
     assert.ok(jobDetail.stdout.includes('PLAY RECAP'));
+    assert.equal(jobDetail.target_count, 1);
+    assert.equal(jobDetail.completed_count, 1);
+    assert.equal(jobDetail.failed_count, 0);
+    assert.ok(Array.isArray(jobDetail.hosts) && jobDetail.hosts.length === 1);
+    assert.equal(jobDetail.hosts[0].server_id, testServerId);
+    assert.equal(jobDetail.hosts[0].status, 'SUCCESS');
+
+    // Verify playbook list now exposes last_inventory_id from the executed job
+    const pbAfterRunRes = await fetch(`${baseUrl}/api/automation/playbooks`, {
+      headers: authHeaders,
+    });
+    assert.equal(pbAfterRunRes.status, 200);
+    const pbAfterRunList = await pbAfterRunRes.json();
+    const updatedPbEntry = pbAfterRunList.find((p: any) => p.id === createdPlaybookId);
+    assert.equal(updatedPbEntry?.last_inventory_id, createdInventoryId);
 
     // 14. Verify Failed Playbook handling
     const failPbRes = await fetch(`${baseUrl}/api/automation/playbooks`, {
@@ -428,6 +443,9 @@ test('Ansible Automation Module: Security, Validation, Inventory, Real ansible-p
     }
     assert.equal(finalFailJob?.status, 'FAILED', 'Failing task must result in FAILED status');
     assert.notEqual(finalFailJob?.exit_code, 0);
+    assert.equal(finalFailJob?.failed_count, 1);
+    assert.equal(finalFailJob?.hosts?.[0]?.status, 'FAILED');
+    assert.ok(finalFailJob?.hosts?.[0]?.error?.length > 0);
 
     // 15. Verify Automation Audit Logs contain started, completed, and failed events
     const auditRes = await fetch(`${baseUrl}/api/automation/audit-logs`, {

@@ -49,7 +49,18 @@ import {
 } from '../hooks/useServers.ts';
 import { getInMemoryAuthToken } from '../context/AuthContext.tsx';
 import { useI18n } from '../context/I18nContext.tsx';
-import type { AnsibleInventory, AnsibleJob, AnsibleJobStatus, AnsiblePlaybook } from '../api/automation.ts';
+import type {
+  AnsibleInventory,
+  AnsibleJob,
+  AnsibleJobHostStatus,
+  AnsibleJobStatus,
+  AnsiblePlaybook,
+} from '../api/automation.ts';
+import {
+  AnsibleJobExecutionPanel,
+  RunPlaybookDialog,
+  formatDurationCompact,
+} from '../components/AnsibleJobExecutionView.tsx';
 
 interface LayoutOutletContext {
   openAddServerModal: () => void;
@@ -335,22 +346,34 @@ export const AutomationPage: React.FC = () => {
   // --- Run Job & Live SSE Output State ---
   const [runPlaybookId, setRunPlaybookId] = useState<number>(0);
   const [runInventoryId, setRunInventoryId] = useState<number>(0);
+  const [runTargetServerIds, setRunTargetServerIds] = useState<number[]>([]);
   const [runCheckMode, setRunCheckMode] = useState<boolean>(false);
   const [runDiffMode, setRunDiffMode] = useState<boolean>(false);
   const [runTags, setRunTags] = useState<string>('');
   const [runExtraVarsJson, setRunExtraVarsJson] = useState<string>('{}');
   const [runError, setRunError] = useState<string>('');
 
+  // Per-playbook selected inventory (defaults to last_inventory_id if present, never auto-picks first server)
+  const [playbookInventoryMap, setPlaybookInventoryMap] = useState<Record<number, number>>({});
+
+  // Run Confirmation Dialog State
+  const [runDialogPlaybook, setRunDialogPlaybook] = useState<AnsiblePlaybook | null>(null);
+  const [runDialogError, setRunDialogError] = useState<string>('');
+
   const [activeJobId, setActiveJobId] = useState<number | null>(null);
+  const [livePlaybookName, setLivePlaybookName] = useState<string>('');
+  const [liveInventoryName, setLiveInventoryName] = useState<string>('');
+  const [liveCheckMode, setLiveCheckMode] = useState<boolean>(false);
+  const [liveStartedAt, setLiveStartedAt] = useState<string | null>(null);
   const [liveStatus, setLiveStatus] = useState<AnsibleJobStatus | null>(null);
+  const [liveHosts, setLiveHosts] = useState<AnsibleJobHostStatus[]>([]);
+  const [liveCurrentTask, setLiveCurrentTask] = useState<string>('');
   const [liveStdout, setLiveStdout] = useState<string>('');
   const [liveStderr, setLiveStderr] = useState<string>('');
   const [liveExitCode, setLiveExitCode] = useState<number | null>(null);
   const [liveDurationMs, setLiveDurationMs] = useState<number>(0);
-  const [copiedConsole, setCopiedConsole] = useState(false);
 
   const eventSourceRef = useRef<EventSource | null>(null);
-  const consoleEndRef = useRef<HTMLPreElement | null>(null);
 
   useEffect(() => {
     if (!runPlaybookId && playbooks.length > 0) {
@@ -358,11 +381,17 @@ export const AutomationPage: React.FC = () => {
     }
   }, [playbooks, runPlaybookId]);
 
-  useEffect(() => {
-    if (!runInventoryId && inventories.length > 0) {
-      setRunInventoryId(inventories[0].id);
-    }
-  }, [inventories, runInventoryId]);
+  const handleRunInventoryChange = (nextInvId: number) => {
+    setRunInventoryId(nextInvId);
+    const inv = inventories.find((i) => i.id === nextInvId);
+    setRunTargetServerIds(inv ? inv.servers.map((s) => s.id) : []);
+  };
+
+  const toggleRunTargetServer = (srvId: number) => {
+    setRunTargetServerIds((prev) =>
+      prev.includes(srvId) ? prev.filter((id) => id !== srvId) : [...prev, srvId]
+    );
+  };
 
   const closeActiveEventSource = () => {
     if (eventSourceRef.current) {
@@ -393,6 +422,8 @@ export const AutomationPage: React.FC = () => {
         setLiveStatus(data.status || 'RUNNING');
         setLiveStdout(data.stdout || '');
         setLiveStderr(data.stderr || '');
+        if (Array.isArray(data.hosts)) setLiveHosts(data.hosts);
+        if (typeof data.current_task === 'string') setLiveCurrentTask(data.current_task);
         if (data.exit_code !== undefined) setLiveExitCode(data.exit_code);
         if (data.duration_ms !== undefined) setLiveDurationMs(data.duration_ms);
       } catch {
@@ -404,6 +435,9 @@ export const AutomationPage: React.FC = () => {
       try {
         const data = JSON.parse(ev.data);
         if (data.status) setLiveStatus(data.status);
+        if (data.started_at) setLiveStartedAt(data.started_at);
+        if (Array.isArray(data.hosts)) setLiveHosts(data.hosts);
+        if (typeof data.current_task === 'string') setLiveCurrentTask(data.current_task);
       } catch {
         // Ignore
       }
@@ -417,9 +451,8 @@ export const AutomationPage: React.FC = () => {
         } else {
           setLiveStdout((prev) => prev + (data.chunk || ''));
         }
-        if (consoleEndRef.current) {
-          consoleEndRef.current.scrollTop = consoleEndRef.current.scrollHeight;
-        }
+        if (Array.isArray(data.hosts)) setLiveHosts(data.hosts);
+        if (typeof data.current_task === 'string') setLiveCurrentTask(data.current_task);
       } catch {
         // Ignore
       }
@@ -429,6 +462,8 @@ export const AutomationPage: React.FC = () => {
       try {
         const data = JSON.parse(ev.data);
         if (data.status) setLiveStatus(data.status);
+        if (Array.isArray(data.hosts)) setLiveHosts(data.hosts);
+        setLiveCurrentTask('');
         if (data.exit_code !== undefined) setLiveExitCode(data.exit_code);
         if (data.duration_ms !== undefined) setLiveDurationMs(data.duration_ms);
       } catch {
@@ -445,6 +480,28 @@ export const AutomationPage: React.FC = () => {
     };
   };
 
+  const applyStartedJobToLiveState = (job: AnsibleJob) => {
+    setActiveJobId(job.id);
+    setLivePlaybookName(job.playbook_name);
+    setLiveInventoryName(job.inventory_name);
+    setLiveCheckMode(job.check_mode);
+    setLiveStartedAt(job.started_at || job.created_at);
+    setLiveStatus(job.status);
+    setLiveHosts(Array.isArray(job.hosts) ? job.hosts : []);
+    setLiveCurrentTask(job.current_task || '');
+    setLiveStdout('');
+    setLiveStderr('');
+    setLiveExitCode(null);
+    setLiveDurationMs(0);
+    if (job.playbook_id && job.inventory_id) {
+      setPlaybookInventoryMap((prev) => ({
+        ...prev,
+        [job.playbook_id!]: job.inventory_id!,
+      }));
+    }
+    void connectJobStream(job.id);
+  };
+
   const handleLaunchJob = () => {
     setRunError('');
     if (!runPlaybookId) {
@@ -456,6 +513,15 @@ export const AutomationPage: React.FC = () => {
         t(
           'Выберите или создайте Ansible Inventory с целевыми серверами',
           'Select or create an Ansible Inventory with target servers'
+        )
+      );
+      return;
+    }
+    if (runTargetServerIds.length === 0) {
+      setRunError(
+        t(
+          'Выберите хотя бы один целевой сервер из инвентаря',
+          'Select at least one target server from the inventory'
         )
       );
       return;
@@ -477,6 +543,7 @@ export const AutomationPage: React.FC = () => {
       {
         playbook_id: runPlaybookId,
         inventory_id: runInventoryId,
+        target_server_ids: runTargetServerIds,
         check_mode: runCheckMode,
         diff_mode: runDiffMode,
         tags: runTags,
@@ -484,13 +551,7 @@ export const AutomationPage: React.FC = () => {
       },
       {
         onSuccess: (job) => {
-          setActiveJobId(job.id);
-          setLiveStatus(job.status);
-          setLiveStdout('');
-          setLiveStderr('');
-          setLiveExitCode(null);
-          setLiveDurationMs(0);
-          void connectJobStream(job.id);
+          applyStartedJobToLiveState(job);
         },
         onError: (err: any) => {
           setRunError(err?.message || 'Failed to start Ansible job');
@@ -500,8 +561,59 @@ export const AutomationPage: React.FC = () => {
   };
 
   const handleOpenRunWithPlaybook = (pb: AnsiblePlaybook) => {
-    setRunPlaybookId(pb.id);
-    switchTab('run');
+    setRunDialogError('');
+    setRunDialogPlaybook(pb);
+  };
+
+  const handleConfirmRunDialog = (params: {
+    playbookId: number;
+    inventoryId: number;
+    targetServerIds: number[];
+    checkMode: boolean;
+    diffMode: boolean;
+    tags: string;
+    extraVarsJson: string;
+  }) => {
+    setRunDialogError('');
+    let parsedExtraVars: Record<string, any> = {};
+    if (params.extraVarsJson.trim()) {
+      try {
+        parsedExtraVars = JSON.parse(params.extraVarsJson);
+      } catch {
+        setRunDialogError(
+          t('Поле Extra Vars должно содержать валидный JSON-объект', 'Extra Vars must be valid JSON')
+        );
+        return;
+      }
+    }
+
+    startJobMut.mutate(
+      {
+        playbook_id: params.playbookId,
+        inventory_id: params.inventoryId,
+        target_server_ids: params.targetServerIds,
+        check_mode: params.checkMode,
+        diff_mode: params.diffMode,
+        tags: params.tags,
+        extra_vars: parsedExtraVars,
+      },
+      {
+        onSuccess: (job) => {
+          setRunDialogPlaybook(null);
+          setRunPlaybookId(params.playbookId);
+          setRunInventoryId(params.inventoryId);
+          setRunTargetServerIds(params.targetServerIds);
+          setRunCheckMode(params.checkMode);
+          setRunDiffMode(params.diffMode);
+          setRunTags(params.tags);
+          setRunExtraVarsJson(params.extraVarsJson);
+          applyStartedJobToLiveState(job);
+        },
+        onError: (err: any) => {
+          setRunDialogError(err?.message || 'Failed to start Ansible job');
+        },
+      }
+    );
   };
 
   // --- Job Details Modal / Drawer in History Tab ---
@@ -705,117 +817,229 @@ export const AutomationPage: React.FC = () => {
           TAB 1: PLAYBOOKS
          ===================================================================== */}
       {activeTab === 'playbooks' && (
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-          {/* Left Column: Playbook List */}
-          <div className="space-y-4 lg:col-span-5">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
-                {t('Каталог Ansible Playbooks', 'Ansible Playbook Library')}
-              </h2>
-              <button
-                type="button"
-                onClick={openCreatePlaybook}
-                className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
-              >
-                <Plus className="h-3.5 w-3.5" />
-                <span>{t('+ Новый плейбук', '+ New Playbook')}</span>
-              </button>
+        <div className="space-y-6">
+          {activeJobId && (
+            <AnsibleJobExecutionPanel
+              jobId={activeJobId}
+              playbookName={livePlaybookName}
+              inventoryName={liveInventoryName}
+              status={liveStatus}
+              startedAt={liveStartedAt}
+              durationMs={liveDurationMs}
+              exitCode={liveExitCode}
+              currentTask={liveCurrentTask}
+              hosts={liveHosts}
+              stdout={liveStdout}
+              stderr={liveStderr}
+              checkMode={liveCheckMode}
+              onCancel={() => cancelJobMut.mutate(activeJobId)}
+              isCancelling={cancelJobMut.isPending}
+              onClose={() => setActiveJobId(null)}
+            />
+          )}
+
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+            {/* Left Column: Playbook List */}
+            <div className="space-y-4 lg:col-span-5">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
+                  {t('Каталог Ansible Playbooks', 'Ansible Playbook Library')}
+                </h2>
+                <button
+                  type="button"
+                  onClick={openCreatePlaybook}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  <span>{t('+ Новый плейбук', '+ New Playbook')}</span>
+                </button>
+              </div>
+
+              {isPlaybooksLoading ? (
+                <div className="space-y-3">
+                  <div className="h-24 animate-pulse rounded-lg bg-[#1E293B]" />
+                  <div className="h-24 animate-pulse rounded-lg bg-[#1E293B]" />
+                </div>
+              ) : playbooks.length === 0 ? (
+                <div className="rounded-lg border border-slate-800 bg-[#1E293B] p-6 text-center text-xs text-slate-400">
+                  {t('Нет сохранённых плейбуков.', 'No playbooks created yet.')}
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {playbooks.map((pb) => {
+                    const isSelected = editingPlaybook?.id === pb.id && !isCreatingPlaybook;
+                    const configuredInvId =
+                      playbookInventoryMap[pb.id] !== undefined
+                        ? playbookInventoryMap[pb.id]
+                        : pb.last_inventory_id || 0;
+                    const cardInventory =
+                      inventories.find((inv) => inv.id === configuredInvId) || null;
+
+                    return (
+                      <div
+                        key={pb.id}
+                        className={`rounded-lg border p-4 transition-colors ${
+                          isSelected
+                            ? 'border-emerald-500/60 bg-[#1E293B]'
+                            : 'border-slate-800 bg-[#1E293B]/80 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <h3 className="text-sm font-semibold text-slate-100">{pb.name}</h3>
+                            <p className="mt-1 text-xs text-slate-400 line-clamp-2">
+                              {pb.description || t('Без описания', 'No description')}
+                            </p>
+                          </div>
+                          <span
+                            className={`shrink-0 rounded px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
+                              pb.validation_status === 'valid'
+                                ? 'bg-emerald-500/15 text-emerald-400'
+                                : pb.validation_status === 'invalid'
+                                ? 'bg-rose-500/15 text-rose-400'
+                                : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            {pb.validation_status}
+                          </span>
+                        </div>
+
+                        {/* Targets Block (Inventory -> Servers) */}
+                        <div className="mt-3 rounded-md border border-slate-800/90 bg-[#0F172A]/80 p-2.5 text-xs">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                              Targets
+                            </span>
+                            <select
+                              value={configuredInvId}
+                              onChange={(e) => {
+                                const nextId = Number(e.target.value);
+                                setPlaybookInventoryMap((prev) => ({
+                                  ...prev,
+                                  [pb.id]: nextId,
+                                }));
+                              }}
+                              className="rounded border border-slate-700 bg-[#1E293B] px-2 py-0.5 text-[11px] text-slate-200 focus:border-emerald-500 focus:outline-none"
+                            >
+                              <option value={0}>
+                                {t('Inventory: Не выбран (Not selected)', 'Inventory: Not selected')}
+                              </option>
+                              {inventories.map((inv) => (
+                                <option key={inv.id} value={inv.id}>
+                                  Inventory: {inv.name} ({inv.server_count})
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          {!cardInventory ? (
+                            <div className="mt-1.5 flex items-center justify-between text-[11px] text-slate-500">
+                              <span>
+                                {t('Inventory: Не выбран (Not selected)', 'Inventory: Not selected')}
+                              </span>
+                              <span className="font-mono">
+                                {t('Targets: Не настроены (Not configured)', 'Targets: Not configured')}
+                              </span>
+                            </div>
+                          ) : cardInventory.servers.length === 0 ? (
+                            <div className="mt-1.5 text-[11px] text-amber-400">
+                              {t(
+                                `Inventory "${cardInventory.name}" не содержит серверов`,
+                                `Inventory "${cardInventory.name}" has 0 servers`
+                              )}
+                            </div>
+                          ) : (
+                            <div className="mt-2 space-y-1">
+                              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                                <span>
+                                  Inventory:{' '}
+                                  <strong className="text-emerald-400">
+                                    {cardInventory.name}
+                                  </strong>
+                                </span>
+                                <span className="font-mono text-slate-300">
+                                  {cardInventory.servers.length}{' '}
+                                  {t('серв.', 'servers')}
+                                </span>
+                              </div>
+                              <div className="space-y-1 pt-0.5">
+                                {cardInventory.servers.map((srv) => (
+                                  <div
+                                    key={srv.id}
+                                    className="flex items-center justify-between rounded bg-[#1E293B]/70 px-2 py-1 font-mono text-[11px]"
+                                  >
+                                    <div className="flex items-center gap-1.5 min-w-0">
+                                      <span
+                                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                                          srv.status === 'online'
+                                            ? 'bg-emerald-400'
+                                            : srv.status === 'offline'
+                                            ? 'bg-rose-500'
+                                            : 'bg-amber-400'
+                                        }`}
+                                      />
+                                      <span className="truncate text-slate-200">{srv.name}</span>
+                                    </div>
+                                    <span className="text-slate-400">{srv.ip_address}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 pt-3">
+                          <span className="font-mono text-[11px] text-slate-500">
+                            {new Date(pb.updated_at).toLocaleDateString()}
+                          </span>
+
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => openEditPlaybook(pb)}
+                              className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0F172A] px-2.5 py-1 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                            >
+                              <Edit3 className="h-3 w-3" />
+                              <span>{t('Редактировать', 'Edit')}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => validatePlaybookIdMut.mutate(pb.id)}
+                              disabled={validatePlaybookIdMut.isPending}
+                              className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0F172A] px-2.5 py-1 text-xs font-medium text-sky-300 hover:bg-slate-800"
+                            >
+                              <ShieldCheck className="h-3 w-3" />
+                              <span>{t('Проверить', 'Validate')}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenRunWithPlaybook(pb)}
+                              className="inline-flex items-center gap-1 rounded bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
+                            >
+                              <Play className="h-3 w-3" />
+                              <span>{t('Запустить', 'Run')}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                deletePlaybookMut.mutate(pb.id);
+                                if (editingPlaybook?.id === pb.id) {
+                                  setEditingPlaybook(null);
+                                }
+                              }}
+                              className="inline-flex items-center rounded border border-slate-800 p-1 text-slate-400 hover:border-rose-500/40 hover:text-rose-400"
+                              title={t('Удалить плейбук', 'Delete playbook')}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-
-            {isPlaybooksLoading ? (
-              <div className="space-y-3">
-                <div className="h-24 animate-pulse rounded-lg bg-[#1E293B]" />
-                <div className="h-24 animate-pulse rounded-lg bg-[#1E293B]" />
-              </div>
-            ) : playbooks.length === 0 ? (
-              <div className="rounded-lg border border-slate-800 bg-[#1E293B] p-6 text-center text-xs text-slate-400">
-                {t('Нет сохранённых плейбуков.', 'No playbooks created yet.')}
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {playbooks.map((pb) => {
-                  const isSelected = editingPlaybook?.id === pb.id && !isCreatingPlaybook;
-                  return (
-                    <div
-                      key={pb.id}
-                      className={`rounded-lg border p-4 transition-colors ${
-                        isSelected
-                          ? 'border-emerald-500/60 bg-[#1E293B]'
-                          : 'border-slate-800 bg-[#1E293B]/80 hover:border-slate-700'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <h3 className="text-sm font-semibold text-slate-100">{pb.name}</h3>
-                          <p className="mt-1 text-xs text-slate-400 line-clamp-2">
-                            {pb.description || t('Без описания', 'No description')}
-                          </p>
-                        </div>
-                        <span
-                          className={`shrink-0 rounded px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
-                            pb.validation_status === 'valid'
-                              ? 'bg-emerald-500/15 text-emerald-400'
-                              : pb.validation_status === 'invalid'
-                              ? 'bg-rose-500/15 text-rose-400'
-                              : 'bg-slate-800 text-slate-400'
-                          }`}
-                        >
-                          {pb.validation_status}
-                        </span>
-                      </div>
-
-                      <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 pt-3">
-                        <span className="font-mono text-[11px] text-slate-500">
-                          {new Date(pb.updated_at).toLocaleDateString()}
-                        </span>
-
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => openEditPlaybook(pb)}
-                            className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0F172A] px-2.5 py-1 text-xs font-medium text-slate-200 hover:bg-slate-800"
-                          >
-                            <Edit3 className="h-3 w-3" />
-                            <span>{t('Редактировать', 'Edit')}</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => validatePlaybookIdMut.mutate(pb.id)}
-                            disabled={validatePlaybookIdMut.isPending}
-                            className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0F172A] px-2.5 py-1 text-xs font-medium text-sky-300 hover:bg-slate-800"
-                          >
-                            <ShieldCheck className="h-3 w-3" />
-                            <span>{t('Проверить', 'Validate')}</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleOpenRunWithPlaybook(pb)}
-                            className="inline-flex items-center gap-1 rounded bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
-                          >
-                            <Play className="h-3 w-3" />
-                            <span>{t('Запустить', 'Run')}</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              deletePlaybookMut.mutate(pb.id);
-                              if (editingPlaybook?.id === pb.id) {
-                                setEditingPlaybook(null);
-                              }
-                            }}
-                            className="inline-flex items-center rounded border border-slate-800 p-1 text-slate-400 hover:border-rose-500/40 hover:text-rose-400"
-                            title={t('Удалить плейбук', 'Delete playbook')}
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
 
           {/* Right Column: YAML Playbook Editor */}
           <div className="lg:col-span-7">
@@ -940,6 +1164,7 @@ export const AutomationPage: React.FC = () => {
               </div>
             </div>
           </div>
+          </div>
         </div>
       )}
 
@@ -1038,7 +1263,7 @@ export const AutomationPage: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => {
-                            setRunInventoryId(inv.id);
+                            handleRunInventoryChange(inv.id);
                             switchTab('run');
                           }}
                           className="inline-flex items-center gap-1 rounded bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
@@ -1281,11 +1506,11 @@ export const AutomationPage: React.FC = () => {
                 </div>
                 <select
                   value={runInventoryId}
-                  onChange={(e) => setRunInventoryId(Number(e.target.value))}
+                  onChange={(e) => handleRunInventoryChange(Number(e.target.value))}
                   className="w-full rounded-md border border-slate-700 bg-[#0F172A] px-3 py-2 text-xs text-slate-100 focus:border-emerald-500 focus:outline-none"
                 >
                   <option value={0}>
-                    {t('-- Выберите инвентарь --', '-- Select Inventory --')}
+                    {t('-- Выберите инвентарь (Not selected) --', '-- Select Inventory (Not selected) --')}
                   </option>
                   {inventories.map((inv) => (
                     <option key={inv.id} value={inv.id}>
@@ -1294,15 +1519,63 @@ export const AutomationPage: React.FC = () => {
                   ))}
                 </select>
                 {selectedRunInventory && (
-                  <div className="mt-1.5 flex flex-wrap gap-1">
-                    {selectedRunInventory.servers.map((s) => (
-                      <span
-                        key={s.id}
-                        className="rounded bg-[#0F172A] px-2 py-0.5 font-mono text-[10px] text-slate-300"
-                      >
-                        {s.name} ({s.ip_address})
+                  <div className="mt-2.5 rounded-md border border-slate-800 bg-[#0F172A] p-3 space-y-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-semibold text-slate-300">
+                        {t('Целевые серверы (Target servers):', 'Target servers:')}
                       </span>
-                    ))}
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setRunTargetServerIds(
+                              selectedRunInventory.servers.map((s) => s.id)
+                            )
+                          }
+                          className="text-emerald-400 hover:underline"
+                        >
+                          {t('Все', 'All')}
+                        </button>
+                        <span className="text-slate-600">·</span>
+                        <button
+                          type="button"
+                          onClick={() => setRunTargetServerIds([])}
+                          className="text-slate-400 hover:underline"
+                        >
+                          {t('Сбросить', 'Clear')}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="max-h-40 space-y-1 overflow-y-auto">
+                      {selectedRunInventory.servers.map((s) => {
+                        const checked = runTargetServerIds.includes(s.id);
+                        return (
+                          <label
+                            key={s.id}
+                            className={`flex cursor-pointer items-center justify-between rounded border px-2.5 py-1.5 font-mono text-[11px] ${
+                              checked
+                                ? 'border-emerald-500/40 bg-emerald-500/10 text-slate-100'
+                                : 'border-slate-800 bg-[#1E293B]/50 text-slate-400'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleRunTargetServer(s.id)}
+                                className="rounded border-slate-600 text-emerald-500"
+                              />
+                              <span>{s.name}</span>
+                            </div>
+                            <span className="text-slate-400">{s.ip_address}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                    <div className="border-t border-slate-800 pt-1.5 font-mono text-[11px] text-slate-400">
+                      Total: {runTargetServerIds.length} / {selectedRunInventory.servers.length}{' '}
+                      {t('серверов выбрано', 'servers selected')}
+                    </div>
                   </div>
                 )}
               </div>
@@ -1396,70 +1669,49 @@ export const AutomationPage: React.FC = () => {
             </div>
           </div>
 
-          {/* Right Column: Live SSE Execution Terminal */}
+          {/* Right Column: Live SSE Execution Panel with Per-Server Status */}
           <div className="lg:col-span-7">
-            <div className="flex h-full flex-col rounded-lg border border-slate-800 bg-[#1E293B] p-5">
-              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
-                <div className="flex items-center gap-2.5">
-                  <Terminal className="h-4 w-4 text-emerald-400" />
-                  <h2 className="text-sm font-semibold text-slate-100">
-                    {activeJobId
-                      ? `Job #${activeJobId} — Live SSE Stream`
-                      : t('Консоль вывода ansible-playbook (SSE)', 'Live Ansible Execution Output (SSE)')}
-                  </h2>
-                  {renderStatusBadge(liveStatus)}
-                </div>
-
-                <div className="flex items-center gap-2 font-mono text-xs text-slate-400">
-                  {liveExitCode !== null && <span>exit={liveExitCode}</span>}
-                  {liveDurationMs > 0 && <span>{liveDurationMs}ms</span>}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const text = [liveStdout, liveStderr].filter(Boolean).join('\n');
-                      navigator.clipboard?.writeText(text);
-                      setCopiedConsole(true);
-                      setTimeout(() => setCopiedConsole(false), 1500);
-                    }}
-                    className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0F172A] px-2 py-1 text-[11px] text-slate-300 hover:bg-slate-800"
-                  >
-                    <Copy className="h-3 w-3" />
-                    <span>{copiedConsole ? t('Скопировано', 'Copied') : t('Копировать', 'Copy')}</span>
-                  </button>
-                </div>
-              </div>
-
-              <pre
-                ref={consoleEndRef}
-                className="mt-3 flex-1 min-h-[380px] max-h-[540px] overflow-y-auto rounded-md border border-slate-800 bg-[#0F172A] p-4 font-mono text-xs leading-relaxed text-slate-200 whitespace-pre-wrap"
-              >
-                {liveStdout || liveStderr ? (
-                  <>
-                    {liveStdout}
-                    {liveStderr && (
-                      <span className="text-rose-400">
-                        {liveStdout ? '\n' : ''}
-                        {liveStderr}
-                      </span>
-                    )}
-                  </>
-                ) : activeJobId ? (
-                  <span className="text-slate-400">
-                    {t(
-                      'Ожидание потокового вывода от процесса ansible-playbook...',
-                      'Waiting for real-time stdout/stderr stream from ansible-playbook...'
-                    )}
-                  </span>
-                ) : (
-                  <span className="text-slate-500">
-                    {t(
-                      'Выберите плейбук и инвентарь слева и нажмите «Запустить Ansible Playbook». Вывод PLAY / TASK / PLAY RECAP будет транслироваться сюда в реальном времени через SSE.',
-                      'Select a playbook and inventory on the left and click "Execute Ansible Playbook". Real-time PLAY / TASK / PLAY RECAP output streams here over SSE.'
-                    )}
-                  </span>
-                )}
-              </pre>
-            </div>
+            <AnsibleJobExecutionPanel
+              jobId={activeJobId}
+              playbookName={livePlaybookName || selectedRunPlaybook?.name || '—'}
+              inventoryName={liveInventoryName || selectedRunInventory?.name || '—'}
+              status={liveStatus}
+              startedAt={liveStartedAt}
+              durationMs={liveDurationMs}
+              exitCode={liveExitCode}
+              currentTask={liveCurrentTask}
+              hosts={
+                activeJobId
+                  ? liveHosts
+                  : selectedRunInventory
+                  ? selectedRunInventory.servers
+                      .filter((s) => runTargetServerIds.includes(s.id))
+                      .map((s) => ({
+                        job_id: 0,
+                        server_id: s.id,
+                        server_name: s.name,
+                        ip_address: s.ip_address,
+                        host_alias: `${s.name}-${s.id}`,
+                        status: 'PENDING',
+                        started_at: null,
+                        finished_at: null,
+                        duration_ms: null,
+                        ok_count: 0,
+                        changed_count: 0,
+                        failed_count: 0,
+                        unreachable_count: 0,
+                        skipped_count: 0,
+                        current_task: '',
+                        error: '',
+                      }))
+                  : []
+              }
+              stdout={liveStdout}
+              stderr={liveStderr}
+              checkMode={liveCheckMode || runCheckMode}
+              onCancel={activeJobId ? () => cancelJobMut.mutate(activeJobId) : undefined}
+              isCancelling={cancelJobMut.isPending}
+            />
           </div>
         </div>
       )}
@@ -1539,12 +1791,12 @@ export const AutomationPage: React.FC = () => {
               <thead>
                 <tr className="border-b border-slate-800 font-medium text-slate-400">
                   <th className="px-4 py-3">Job ID</th>
-                  <th className="px-4 py-3">{t('Статус', 'Status')}</th>
                   <th className="px-4 py-3">{t('Плейбук', 'Playbook')}</th>
                   <th className="px-4 py-3">{t('Инвентарь', 'Inventory')}</th>
-                  <th className="px-4 py-3">{t('Режим / Теги', 'Mode / Tags')}</th>
+                  <th className="px-4 py-3">{t('Серверы (Targets)', 'Targets')}</th>
+                  <th className="px-4 py-3">{t('Статус', 'Status')}</th>
                   <th className="px-4 py-3">{t('Длительность', 'Duration')}</th>
-                  <th className="px-4 py-3">{t('Время запуска', 'Created At')}</th>
+                  <th className="px-4 py-3">{t('Время запуска', 'Started')}</th>
                   <th className="px-4 py-3 text-right">{t('Действия', 'Actions')}</th>
                 </tr>
               </thead>
@@ -1556,39 +1808,65 @@ export const AutomationPage: React.FC = () => {
                     </td>
                   </tr>
                 ) : (
-                  jobs.map((job) => (
-                    <tr key={job.id} className="hover:bg-slate-800/40">
-                      <td className="px-4 py-3 font-mono font-semibold text-slate-200">
-                        #{job.id}
-                      </td>
-                      <td className="px-4 py-3">{renderStatusBadge(job.status)}</td>
-                      <td className="px-4 py-3 font-medium text-slate-100">
-                        {job.playbook_name}
-                      </td>
-                      <td className="px-4 py-3 text-slate-300">{job.inventory_name}</td>
-                      <td className="px-4 py-3 font-mono text-[11px] text-slate-400">
-                        {job.check_mode ? '--check ' : ''}
-                        {job.diff_mode ? '--diff ' : ''}
-                        {job.tags.length > 0 ? `tags:${job.tags.join(',')}` : 'default'}
-                      </td>
-                      <td className="px-4 py-3 font-mono text-slate-400 tabular-nums">
-                        {job.duration_ms}ms
-                      </td>
-                      <td className="px-4 py-3 font-mono text-slate-400 tabular-nums">
-                        {new Date(job.created_at).toLocaleString()}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <button
-                          type="button"
-                          onClick={() => setInspectedJobId(job.id)}
-                          className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0F172A] px-2.5 py-1 text-xs font-medium text-slate-200 hover:bg-slate-800"
-                        >
-                          <Eye className="h-3 w-3 text-emerald-400" />
-                          <span>{t('Лог вывода', 'View Output')}</span>
-                        </button>
-                      </td>
-                    </tr>
-                  ))
+                  jobs.map((job) => {
+                    const targetCount = job.target_count || (job.hosts ? job.hosts.length : 0);
+                    return (
+                      <tr key={job.id} className="hover:bg-slate-800/40">
+                        <td className="px-4 py-3 font-mono font-semibold text-slate-200">
+                          #{job.id}
+                        </td>
+                        <td className="px-4 py-3 font-medium text-slate-100">
+                          {job.playbook_name}
+                        </td>
+                        <td className="px-4 py-3 text-emerald-400 font-medium">
+                          {job.inventory_name}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-[11px] text-slate-300">
+                          <div>
+                            {targetCount} {t('серв.', 'servers')}
+                          </div>
+                          {Array.isArray(job.hosts) && job.hosts.length > 0 && (
+                            <div className="mt-0.5 flex flex-wrap gap-1 text-[10px] text-slate-400">
+                              {job.hosts.slice(0, 3).map((h) => (
+                                <span
+                                  key={h.server_id}
+                                  className={`rounded px-1.5 py-0.5 ${
+                                    h.status === 'SUCCESS'
+                                      ? 'bg-emerald-500/10 text-emerald-300'
+                                      : h.status === 'FAILED'
+                                      ? 'bg-rose-500/10 text-rose-300'
+                                      : 'bg-slate-800 text-slate-300'
+                                  }`}
+                                >
+                                  {h.server_name}
+                                </span>
+                              ))}
+                              {job.hosts.length > 3 && (
+                                <span className="text-slate-500">+{job.hosts.length - 3}</span>
+                              )}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">{renderStatusBadge(job.status)}</td>
+                        <td className="px-4 py-3 font-mono text-slate-400 tabular-nums">
+                          {formatDurationCompact(job.duration_ms)}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-slate-400 tabular-nums">
+                          {new Date(job.started_at || job.created_at).toLocaleString()}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <button
+                            type="button"
+                            onClick={() => setInspectedJobId(job.id)}
+                            className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0F172A] px-2.5 py-1 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                          >
+                            <Eye className="h-3 w-3 text-emerald-400" />
+                            <span>{t('Детали / Лог', 'Details & Log')}</span>
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -1596,45 +1874,27 @@ export const AutomationPage: React.FC = () => {
 
           {/* Inspected Job Output Drawer */}
           {inspectedJobId && (
-            <div className="rounded-lg border border-emerald-500/40 bg-[#1E293B] p-5 space-y-3">
-              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-                <div className="flex items-center gap-3">
-                  <h3 className="text-sm font-semibold text-slate-100">
-                    {t(`Детали выполнения Job #${inspectedJobId}`, `Job #${inspectedJobId} Execution Details`)}
-                  </h3>
-                  {inspectedJob && renderStatusBadge(inspectedJob.status)}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setInspectedJobId(null)}
-                  className="rounded border border-slate-700 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-800"
-                >
-                  {t('Закрыть', 'Close')}
-                </button>
-              </div>
-
+            <div>
               {isInspectedJobLoading || !inspectedJob ? (
-                <div className="py-6 text-center text-xs text-slate-400">
+                <div className="rounded-lg border border-slate-800 bg-[#1E293B] p-6 text-center text-xs text-slate-400">
                   {t('Загрузка полного вывода Job...', 'Loading full job output...')}
                 </div>
               ) : (
-                <div className="space-y-3">
-                  <div className="flex flex-wrap gap-4 font-mono text-xs text-slate-400">
-                    <span>Playbook: {inspectedJob.playbook_name}</span>
-                    <span>Inventory: {inspectedJob.inventory_name}</span>
-                    <span>Exit Code: {inspectedJob.exit_code ?? '—'}</span>
-                    <span>Duration: {inspectedJob.duration_ms}ms</span>
-                    <span>
-                      Extra Vars: {JSON.stringify(inspectedJob.extra_vars || {})}
-                    </span>
-                  </div>
-                  <pre className="max-h-96 overflow-y-auto rounded border border-slate-800 bg-[#0F172A] p-4 font-mono text-xs text-slate-200 whitespace-pre-wrap">
-                    {(
-                      (inspectedJob.stdout || '') +
-                      (inspectedJob.stderr ? `\n${inspectedJob.stderr}` : '')
-                    ).trim() || 'No output recorded.'}
-                  </pre>
-                </div>
+                <AnsibleJobExecutionPanel
+                  jobId={inspectedJob.id}
+                  playbookName={inspectedJob.playbook_name}
+                  inventoryName={inspectedJob.inventory_name}
+                  status={inspectedJob.status}
+                  startedAt={inspectedJob.started_at || inspectedJob.created_at}
+                  durationMs={inspectedJob.duration_ms}
+                  exitCode={inspectedJob.exit_code}
+                  currentTask={inspectedJob.current_task || ''}
+                  hosts={Array.isArray(inspectedJob.hosts) ? inspectedJob.hosts : []}
+                  stdout={inspectedJob.stdout || ''}
+                  stderr={inspectedJob.stderr || ''}
+                  checkMode={inspectedJob.check_mode}
+                  onClose={() => setInspectedJobId(null)}
+                />
               )}
             </div>
           )}
@@ -1800,6 +2060,29 @@ export const AutomationPage: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Confirmation / Run Ansible Playbook Modal */}
+      <RunPlaybookDialog
+        open={Boolean(runDialogPlaybook)}
+        playbook={runDialogPlaybook}
+        inventories={inventories}
+        initialInventoryId={
+          runDialogPlaybook
+            ? playbookInventoryMap[runDialogPlaybook.id] !== undefined
+              ? playbookInventoryMap[runDialogPlaybook.id]
+              : runDialogPlaybook.last_inventory_id || 0
+            : 0
+        }
+        isSubmitting={startJobMut.isPending}
+        errorMessage={runDialogError}
+        onClose={() => setRunDialogPlaybook(null)}
+        onCreateInventoryClick={() => {
+          setRunDialogPlaybook(null);
+          openCreateInventory();
+          switchTab('inventories');
+        }}
+        onConfirmRun={handleConfirmRunDialog}
+      />
     </div>
   );
 };
